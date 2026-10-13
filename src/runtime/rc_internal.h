@@ -45,6 +45,9 @@ typedef struct rc_memrefs_t {
   rc_memref_list_t memrefs;
   rc_modified_memref_list_t modified_memrefs;
   rc_memref_dependencies_t* dependencies;  /* Which modified memrefs need updating (see rc_memref.c). */
+  rc_memref_t** index;     /* hash index of both lists, only for lists created by rc_memrefs_init */
+  uint32_t index_capacity; /* number of slots in index (a power of 2) */
+  uint32_t index_count;    /* number of entries in index */
 } rc_memrefs_t;
 
 typedef struct rc_trigger_with_memrefs_t {
