@@ -6030,10 +6030,8 @@ static void rc_client_update_memref_values(rc_client_t* client) {
       rc_modified_memref_t* modified_memref = modified_memref_list->items;
       const rc_modified_memref_t* modified_memref_stop = modified_memref + modified_memref_list->count;
 
-      for (; modified_memref < modified_memref_stop; ++modified_memref) {
-        rc_update_memref_value(&modified_memref->memref.value,
-            rc_get_modified_memref_value(modified_memref, rc_client_read_modified_memory_helper, client));
-      }
+      for (; modified_memref < modified_memref_stop; ++modified_memref)
+        rc_update_modified_memref_value(modified_memref, rc_client_read_modified_memory_helper, client);
 
       modified_memref_list = modified_memref_list->next;
     } while (modified_memref_list);

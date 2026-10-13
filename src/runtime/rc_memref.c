@@ -811,6 +811,50 @@ uint32_t rc_get_modified_memref_value(const rc_modified_memref_t* memref, rc_rea
   return value.value.u32;
 }
 
+static int rc_operand_is_unchanged(const rc_operand_t* operand) {
+  switch (operand->type) {
+    case RC_OPERAND_CONST:
+    case RC_OPERAND_FP:
+    case RC_OPERAND_FUNC:
+      return 1;
+
+    case RC_OPERAND_RECALL:
+      return 0;
+
+    default:
+      /* a variable may be updated more than once a frame. an invalidated memref changes type. */
+      if (operand->value.memref->value.memref_type == RC_MEMREF_TYPE_VALUE ||
+          operand->value.memref->value.type == RC_VALUE_TYPE_NONE)
+        return 0;
+
+      return !operand->value.memref->value.changed;
+  }
+}
+
+void rc_update_modified_memref_value(rc_modified_memref_t* memref, rc_read_memory_func_t read_memory, void* ud) {
+  /* if the inputs did not change this frame or the last, they have the same value, prior and
+   * changed flag as when the value was last calculated, so the value would not change. */
+  const uint8_t inputs_unchanged = memref->modifier_type != RC_OPERATOR_INDIRECT_READ &&
+      rc_operand_is_unchanged(&memref->parent) && rc_operand_is_unchanged(&memref->modifier);
+
+  if (inputs_unchanged && memref->inputs_unchanged)
+    memref->memref.value.changed = 0;
+  else
+    rc_update_memref_value(&memref->memref.value, rc_get_modified_memref_value(memref, read_memory, ud));
+
+  memref->inputs_unchanged = inputs_unchanged;
+}
+
+void rc_memrefs_reset_inputs_unchanged(rc_memrefs_t* memrefs) {
+  rc_modified_memref_list_t* modified_memref_list = &memrefs->modified_memrefs;
+  for (; modified_memref_list; modified_memref_list = modified_memref_list->next) {
+    rc_modified_memref_t* modified_memref = modified_memref_list->items;
+    const rc_modified_memref_t* modified_memref_stop = modified_memref + modified_memref_list->count;
+    for (; modified_memref < modified_memref_stop; ++modified_memref)
+      modified_memref->inputs_unchanged = 0;
+  }
+}
+
 void rc_update_memref_values(rc_memrefs_t* memrefs, rc_read_memory_func_t read_memory, void* ud) {
   rc_memref_list_t* memref_list;
   rc_modified_memref_list_t* modified_memref_list;
@@ -836,7 +880,7 @@ void rc_update_memref_values(rc_memrefs_t* memrefs, rc_read_memory_func_t read_m
       const rc_modified_memref_t* modified_memref_stop = modified_memref + modified_memref_list->count;
 
       for (; modified_memref < modified_memref_stop; ++modified_memref)
-        rc_update_memref_value(&modified_memref->memref.value, rc_get_modified_memref_value(modified_memref, read_memory, ud));
+        rc_update_modified_memref_value(modified_memref, read_memory, ud);
 
       modified_memref_list = modified_memref_list->next;
     } while (modified_memref_list);

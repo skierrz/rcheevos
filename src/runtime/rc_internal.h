@@ -18,6 +18,7 @@ typedef struct rc_modified_memref_t {
   rc_operand_t parent;             /* The parent memref this memref is derived from (type will always be a memref type) */
   rc_operand_t modifier;           /* The modifier to apply to the parent. */
   uint8_t modifier_type;           /* How to apply the modifier to the parent. (RC_OPERATOR_*) */
+  uint8_t inputs_unchanged;        /* Non-zero if the inputs did not change when the value was last updated. */
   uint16_t depth;                  /* The number of parents this memref has. */
 }
 rc_modified_memref_t;
@@ -288,6 +289,8 @@ void rc_update_memref_values(rc_memrefs_t* memrefs, rc_read_memory_func_t read_m
 void rc_update_memref_value(rc_memref_value_t* memref, uint32_t value);
 void rc_get_memref_value(rc_typed_value_t* value, rc_memref_t* memref, int operand_type);
 uint32_t rc_get_modified_memref_value(const rc_modified_memref_t* memref, rc_read_memory_func_t read_memory, void* ud);
+void rc_memrefs_reset_inputs_unchanged(rc_memrefs_t* memrefs);
+void rc_update_modified_memref_value(rc_modified_memref_t* memref, rc_read_memory_func_t read_memory, void* ud);
 uint8_t rc_memref_shared_size(uint8_t size);
 uint32_t rc_memref_mask(uint8_t size);
 uint32_t rc_memref_bytes(uint8_t size);

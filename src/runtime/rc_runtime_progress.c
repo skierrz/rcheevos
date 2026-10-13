@@ -1005,6 +1005,10 @@ int rc_runtime_deserialize_progress_sized(rc_runtime_t* runtime, const uint8_t* 
     return RC_INVALID_STATE;
   }
 
+  /* memref values may be restored below (indirect memrefs are restored from the conditions,
+   * even if the state has no memrefs chunk). recalculate every modified memref next frame. */
+  rc_memrefs_reset_inputs_unchanged(runtime->memrefs);
+
   for (i = 0; i < runtime->trigger_count; ++i) {
     rc_runtime_trigger_t* runtime_trigger = &runtime->triggers[i];
     if (runtime_trigger->trigger) {
