@@ -5999,29 +5999,41 @@ int rc_client_is_processing_required(rc_client_t* client)
 /* ===== Change-driven evaluation ===== */
 
 /* Evaluating a trigger is a function of its state (state, has_hits, measured_value, each group's
- * is_paused, each condition's current_hits and is_true) and of the values its conditions read; for
+ * is_paused, each condition's current_hits and is_true) and of what its conditions read; for
  * rc_client's triggers nothing else (they have no memrefs of their own, and AddSource/AddAddress/
- * Remember/Recall resolve to memrefs). So if an evaluation changed none of the trigger's state and
- * returned its state, a later evaluation that reads the same values does the same: skipping it and
- * returning the state gives the same result, the same state and the same bytes. A memref's value,
- * delta and prior can only differ from the previous frame's if it changed this frame or the last.
+ * Remember/Recall resolve to memrefs). And a condition only reads the result of its comparison
+ * (rc_test_condition), except Measured without a hit target, which reads its values. So if an
+ * evaluation changed none of a trigger's state and returned its state, a later evaluation in which
+ * every comparison result and value it reads is the same does the same: skipping it and returning
+ * the state gives the same result, the same state and the same bytes.
  *
- * Per frame, every trigger that reads a memref that changed this frame or the last is stamped with
- * the frame. A trigger is skipped if its last evaluation was clean (it changed nothing and returned
- * the state; found by comparing a snapshot of the state taken before it), nothing it reads has been
- * stamped since, and its state hasn't been changed from outside (resets, unlocks, deserializing and
- * hardcore toggles also drop the whole index). An evaluation is only checked for being clean if
- * nothing it reads was stamped this frame, as otherwise the next frame is unlikely to be skipped. */
+ * A comparison result, and a memref's value, delta and prior, can only differ from the previous
+ * frame's if a memref it reads changed this frame or the last. Per frame, those comparisons are
+ * tested again (once for all the conditions that make the same comparison), and a trigger is
+ * stamped with the frame if a comparison result it reads changed, or a value it reads may have.
+ * A trigger is skipped if its last evaluation was clean (found by comparing a snapshot of its state
+ * taken before it), nothing it reads was stamped since, and its state wasn't changed from outside
+ * (resets, unlocks, deserializing and hardcore toggles also drop the whole index).
+ *
+ * A tally (a condition without a hit target, that isn't AddHits/SubHits) gets a hit on every frame
+ * it is true, and nothing reads that count: an evaluation that only added a hit to tallies is clean
+ * too, and each skipped frame owes them a hit. What is owed is added before the trigger is evaluated
+ * again or anything else reads the counts (serializing, dropping the index).
+ *
+ * A leaderboard's start, submit and cancel triggers are skipped together the same way, while it
+ * isn't started (then its value is evaluated). */
 
 #define RC_CLIENT_CD_NEVER 1   /* not indexed: always evaluated */
 #define RC_CLIENT_CD_CLEAN 2   /* its last evaluation changed nothing and returned its state */
+#define RC_CLIENT_CD_BUSY 4    /* its evaluation at "evaluated" changed it with nothing it reads changed */
+#define RC_CLIENT_CD_BUSY_FRAMES 32 /* frames before a busy one is checked for being clean again */
 #define RC_CLIENT_CD_COMPARISON 0x80000000
 #define RC_CLIENT_CD_MAX_SCAN 64 /* comparisons of a memref looked at to find a duplicate */
 #define RC_CLIENT_CD_MAX_SKIPPED 0x10000 /* frames skipped in a row: tallies can't wrap */
 
 typedef struct rc_client_cd_slot_t {
   uint32_t changed;            /* the last frame that something it reads changed */
-  uint32_t evaluated;          /* the frame of its last clean evaluation */
+  uint32_t evaluated;          /* the frame of its last clean (or busy) evaluation */
   uint32_t skipped;            /* frames skipped since: hits owed to the tallies */
   uint32_t tallies;            /* its first bit in tallies */
   rc_trigger_t* trigger;       /* an achievement's trigger, or */
@@ -6651,12 +6663,24 @@ static int rc_client_cd_skip(rc_client_cd_t* cd, rc_client_cd_slot_t* slot)
   return 0;
 }
 
+/* 1 if an evaluation now could be found clean: nothing the slot reads changed this frame. A busy
+ * slot (one whose state changes with nothing it reads changing, like a hit count growing towards
+ * its target) is only checked again once something it reads changed, or after a while. */
+static int rc_client_cd_candidate(rc_client_cd_t* cd, rc_client_cd_slot_t* slot)
+{
+  return slot->changed != cd->frame && (!(slot->flags & RC_CLIENT_CD_BUSY) ||
+      (int32_t)(slot->changed - slot->evaluated) > 0 || cd->frame - slot->evaluated >= RC_CLIENT_CD_BUSY_FRAMES) &&
+      rc_client_cd_snapshot(cd, slot, 0);
+}
+
 /* after evaluating a slot: it is clean if the evaluation changed nothing (but tallies) */
 static void rc_client_cd_evaluated(rc_client_cd_t* cd, rc_client_cd_slot_t* slot, int candidate, int ret)
 {
-  if (candidate && rc_client_cd_snapshot(cd, slot, 1)) {
-    slot->flags |= RC_CLIENT_CD_CLEAN;
+  if (candidate) {
+    slot->flags &= ~RC_CLIENT_CD_BUSY;
+    slot->flags |= (ret >= 0 && rc_client_cd_snapshot(cd, slot, 1)) ? RC_CLIENT_CD_CLEAN : RC_CLIENT_CD_BUSY;
     slot->evaluated = cd->frame;
+    slot->changed = cd->frame - 1; /* was older: keeps the difference small */
     slot->result = (uint8_t)ret;
   }
   slot->state = rc_client_cd_unit_state(slot);
@@ -6677,10 +6701,10 @@ static int rc_client_cd_evaluate_trigger(rc_client_t* client, rc_client_cd_slot_
   if (rc_client_cd_skip(cd, slot))
     return slot->result;
 
-  candidate = (slot->changed != cd->frame) && rc_client_cd_snapshot(cd, slot, 0);
+  candidate = rc_client_cd_candidate(cd, slot);
   ret = rc_evaluate_trigger(trigger, rc_client_read_modified_memory_helper, client, NULL);
   /* a clean evaluation also returns the state: TRIGGERED and DISABLED return INACTIVE */
-  rc_client_cd_evaluated(cd, slot, candidate && ret == trigger->state, ret);
+  rc_client_cd_evaluated(cd, slot, candidate, ret == trigger->state ? ret : -1);
   return ret;
 }
 
@@ -6700,7 +6724,7 @@ static int rc_client_cd_evaluate_leaderboard(rc_client_t* client, rc_client_cd_s
   if (rc_client_cd_skip(cd, slot))
     return slot->result;
 
-  candidate = (slot->changed != cd->frame) && rc_client_cd_snapshot(cd, slot, 0);
+  candidate = rc_client_cd_candidate(cd, slot);
   ret = rc_evaluate_lboard(lboard, &leaderboard->value, rc_client_read_modified_memory_helper, client, NULL);
   rc_client_cd_evaluated(cd, slot, candidate, ret);
   return ret;

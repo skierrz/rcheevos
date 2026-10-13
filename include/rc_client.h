@@ -111,10 +111,12 @@ RC_EXPORT void RC_CCONV rc_client_set_spectator_mode_enabled(rc_client_t* client
 RC_EXPORT int RC_CCONV rc_client_get_spectator_mode_enabled(const rc_client_t* client);
 
 /**
- * Sets whether an achievement is skipped when evaluating it can't change anything: its last
- * evaluation changed none of its state, and nothing it reads has changed since. The results
- * (events, state, serialized progress) are the same as with it off; it only saves the repeated
- * work, at the cost of an index of what each achievement reads. Off by default.
+ * Sets whether an achievement or leaderboard is skipped when evaluating it can't change anything:
+ * its last evaluation changed none of its state (but hit counts that are never read), and none of
+ * the comparisons and values it reads have changed since. The results (events, states, serialized
+ * progress) are the same as with it off; it only saves the repeated work, at the cost of an index
+ * of what each one reads. While on, the hit counts a skipped achievement is owed are only added
+ * when it is evaluated again or the progress is serialized. Off by default.
  */
 RC_EXPORT void RC_CCONV rc_client_set_change_driven_enabled(rc_client_t* client, int enabled);
 
