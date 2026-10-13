@@ -341,6 +341,11 @@ typedef struct rc_client_state_t {
   uint8_t allow_leaderboards_in_casual;
   uint8_t allow_background_memory_reads;
   uint8_t change_driven;
+  uint8_t memory_read;         /* the last rc_client_do_frame read memory */
+
+  const rc_client_memory_range_t* changed_memory; /* rc_client_set_changed_memory, for the next frame */
+  uint32_t num_changed_memory;
+  uint8_t changed_memory_known;
 
   struct rc_client_load_state_t* load;
   struct rc_client_async_handle_t* async_handles[4];

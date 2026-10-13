@@ -125,6 +125,22 @@ RC_EXPORT void RC_CCONV rc_client_set_change_driven_enabled(rc_client_t* client,
  */
 RC_EXPORT int RC_CCONV rc_client_get_change_driven_enabled(const rc_client_t* client);
 
+typedef struct rc_client_memory_range_t {
+  uint32_t address;
+  uint32_t num_bytes;
+} rc_client_memory_range_t;
+
+/**
+ * Tells the next rc_client_do_frame which memory may have changed since the previous one: every
+ * address at which read_memory could return something else (other bytes, or fewer of them) than
+ * it would have during the previous rc_client_do_frame must be in one of the ranges (any order,
+ * overlaps allowed; count 0: none changed). An indirect read (AddAddress) whose pointer did not
+ * change, and whose target is in none of the ranges, is then not read again: its value is the
+ * same. Applies to the next rc_client_do_frame only, which reads the ranges: they must stay valid
+ * until it returns. Without a call, or with ranges NULL, any memory may have changed.
+ */
+RC_EXPORT void RC_CCONV rc_client_set_changed_memory(rc_client_t* client, const rc_client_memory_range_t* ranges, uint32_t count);
+
 /**
  * Attaches client-specific data to the runtime.
  */

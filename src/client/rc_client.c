@@ -6780,6 +6780,15 @@ static void rc_client_update_memref_values(rc_client_t* client) {
 
   client->state.processing_memref = NULL;
 
+  /* the memory that changed since the last frame, if that frame read memory too */
+  if (dependencies && client->state.changed_memory_known && client->state.memory_read) {
+    const rc_client_memory_range_t* range = client->state.changed_memory;
+    const rc_client_memory_range_t* range_stop = range + client->state.num_changed_memory;
+    rc_memref_dependencies_memory_known(dependencies);
+    for (; range < range_stop; ++range)
+      rc_memref_dependencies_memory_changed(dependencies, range->address, range->num_bytes);
+  }
+
   /* the modified memrefs that changed are numbered after the memrefs */
   rc_update_modified_memref_values(memrefs, dependencies, rc_client_read_modified_memory_helper, client,
                                    cd ? cd->changed : NULL, cd ? &cd->num_changed : NULL, index);
@@ -7251,7 +7260,15 @@ void rc_client_do_frame(rc_client_t* client)
     rc_client_raise_pending_events(client, client->game);
 
     ++client->state.frames_processed;
+    client->state.memory_read = 1;
   }
+  else {
+    client->state.memory_read = 0;
+  }
+
+  /* the changed memory only applies to this frame */
+  client->state.changed_memory_known = 0;
+  client->state.changed_memory = NULL;
 
   /* we've processed a frame. if there's a pause delay in effect, process it */
   if (client->state.unpaused_frame_decay > 0) {
@@ -7886,6 +7903,16 @@ void rc_client_set_change_driven_enabled(rc_client_t* client, int enabled)
 int rc_client_get_change_driven_enabled(const rc_client_t* client)
 {
   return client ? client->state.change_driven : 0;
+}
+
+void rc_client_set_changed_memory(rc_client_t* client, const rc_client_memory_range_t* ranges, uint32_t count)
+{
+  if (!client)
+    return;
+
+  client->state.changed_memory = ranges;
+  client->state.num_changed_memory = ranges ? count : 0;
+  client->state.changed_memory_known = (ranges != NULL);
 }
 
 void rc_client_set_userdata(rc_client_t* client, void* userdata)

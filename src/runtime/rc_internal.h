@@ -299,6 +299,8 @@ void rc_memrefs_reset_inputs_unchanged(rc_memrefs_t* memrefs);
 void rc_update_modified_memref_value(rc_modified_memref_t* memref, rc_read_memory_func_t read_memory, void* ud);
 rc_memref_dependencies_t* rc_memrefs_get_dependencies(rc_memrefs_t* memrefs);
 void rc_memref_dependencies_memref_changed(rc_memref_dependencies_t* dependencies, uint32_t memref_index);
+void rc_memref_dependencies_memory_known(rc_memref_dependencies_t* dependencies);
+void rc_memref_dependencies_memory_changed(rc_memref_dependencies_t* dependencies, uint32_t address, uint32_t num_bytes);
 void rc_update_modified_memref_values(rc_memrefs_t* memrefs, rc_memref_dependencies_t* dependencies,
                                       rc_read_memory_func_t read_memory, void* ud,
                                       uint32_t* changed, uint32_t* num_changed, uint32_t first_number);

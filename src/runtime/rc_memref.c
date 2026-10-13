@@ -1058,7 +1058,24 @@ struct rc_memref_dependencies_t {
   uint32_t* update_next;         /* One bit per modified memref: update next frame. */
   uint16_t* first_dependent;     /* Per memref, then per modified memref: its first entry in dependents. */
   uint16_t* dependents;          /* Indices of the modified memrefs that use each memref. */
+  /* Indirect reads also depend on the memory they read. When the caller says which memory may
+   * have changed (rc_memref_dependencies_memory_changed), only the ones that read it are flagged
+   * for an update; otherwise every one is. Each is found by where it last read, in a hash of
+   * 16-byte pages. */
+  uint8_t memory_known;          /* This frame's memory changes were given. */
+  uint32_t num_indirect;         /* Indirect reads, in list order. */
+  uint32_t* indirect;            /* One bit per modified memref: an indirect read. */
+  uint32_t* target;              /* Per indirect read: the address it last read. */
+  uint16_t* target_index;        /* Per indirect read: its modified memref index. */
+  uint16_t* target_next;         /* Per indirect read: the next one in its bucket. */
+  uint8_t* target_bytes;         /* Per indirect read: the bytes it last read. 0: in no bucket. */
+  uint16_t* bucket;              /* The first indirect read in each bucket. */
+  uint32_t bucket_mask;
 };
+
+#define RC_TARGET_PAGE_SHIFT 4
+#define RC_TARGET_MAX_BYTES 4
+#define RC_TARGET_NONE 0xFFFF
 
 static uint32_t rc_memrefs_find_index(const rc_memrefs_t* memrefs, uint32_t num_memrefs, const rc_memref_t* memref) {
   uint32_t index = 0;
@@ -1137,20 +1154,50 @@ static rc_memref_dependencies_t* rc_memref_dependencies_create(const rc_memrefs_
   const uint32_t num_inputs = num_memrefs + num_modified_memrefs;
   const uint32_t num_words = (num_modified_memrefs + 31) / 32;
   int32_t num_dependents = (num_inputs <= 0xFFFF) ? rc_memref_dependencies_link(memrefs, num_memrefs, NULL, NULL) : -1;
-  uint32_t i, total;
+  const rc_modified_memref_list_t* modified_memref_list;
+  uint32_t i, total, num_indirect = 0, num_buckets = 16;
+
+  for (modified_memref_list = &memrefs->modified_memrefs; modified_memref_list; modified_memref_list = modified_memref_list->next)
+    for (i = 0; i < modified_memref_list->count; ++i)
+      num_indirect += (modified_memref_list->items[i].modifier_type == RC_OPERATOR_INDIRECT_READ);
+  while (num_buckets < num_indirect)
+    num_buckets <<= 1;
 
   if (num_dependents < 0 || num_dependents > 0xFFFF) {
     /* can't be tracked: remember that, so every modified memref is updated every frame */
     dependencies = (rc_memref_dependencies_t*)calloc(1, sizeof(*dependencies));
   }
   else {
-    dependencies = (rc_memref_dependencies_t*)calloc(1, sizeof(*dependencies) + num_words * 2 * sizeof(uint32_t) +
-                                                     (num_inputs + 1 + num_dependents) * sizeof(uint16_t));
+    dependencies = (rc_memref_dependencies_t*)calloc(1, sizeof(*dependencies) + num_words * 3 * sizeof(uint32_t) +
+                                                     (num_inputs + 1 + num_dependents) * sizeof(uint16_t) +
+                                                     num_indirect * (sizeof(uint32_t) + 2 * sizeof(uint16_t) + 1) +
+                                                     num_buckets * sizeof(uint16_t));
     if (dependencies) {
       dependencies->update = (uint32_t*)(dependencies + 1);
       dependencies->update_next = dependencies->update + num_words;
-      dependencies->first_dependent = (uint16_t*)(dependencies->update_next + num_words);
+      dependencies->indirect = dependencies->update_next + num_words;
+      dependencies->target = dependencies->indirect + num_words;
+      dependencies->first_dependent = (uint16_t*)(dependencies->target + num_indirect);
       dependencies->dependents = dependencies->first_dependent + num_inputs + 1;
+      dependencies->target_index = dependencies->dependents + num_dependents;
+      dependencies->target_next = dependencies->target_index + num_indirect;
+      dependencies->bucket = dependencies->target_next + num_indirect;
+      dependencies->target_bytes = (uint8_t*)(dependencies->bucket + num_buckets);
+      dependencies->bucket_mask = num_buckets - 1;
+      dependencies->num_indirect = num_indirect;
+      memset(dependencies->bucket, 0xFF, num_buckets * sizeof(uint16_t));
+
+      for (modified_memref_list = &memrefs->modified_memrefs, i = 0, total = 0; modified_memref_list;
+           modified_memref_list = modified_memref_list->next) {
+        const rc_modified_memref_t* modified_memref = modified_memref_list->items;
+        const rc_modified_memref_t* modified_memref_stop = modified_memref + modified_memref_list->count;
+        for (; modified_memref < modified_memref_stop; ++modified_memref, ++i) {
+          if (modified_memref->modifier_type == RC_OPERATOR_INDIRECT_READ) {
+            dependencies->indirect[i >> 5] |= 1U << (i & 31);
+            dependencies->target_index[total++] = (uint16_t)i;
+          }
+        }
+      }
 
       rc_memref_dependencies_link(memrefs, num_memrefs, dependencies->first_dependent, NULL);
       for (i = 0, total = 0; i <= num_inputs; ++i) {
@@ -1216,6 +1263,94 @@ void rc_memref_dependencies_memref_changed(rc_memref_dependencies_t* dependencie
     dependencies->update[*dependent >> 5] |= 1U << (*dependent & 31);
 }
 
+void rc_memref_dependencies_memory_known(rc_memref_dependencies_t* dependencies) {
+  dependencies->memory_known = 1;
+}
+
+void rc_memref_dependencies_memory_changed(rc_memref_dependencies_t* dependencies, uint32_t address, uint32_t num_bytes) {
+  /* a read of at most RC_TARGET_MAX_BYTES that reaches address starts at most that many bytes - 1 before it */
+  const uint32_t last = (address + num_bytes - 1 < address) ? 0xFFFFFFFF : address + num_bytes - 1;
+  const uint32_t first_page = (address < RC_TARGET_MAX_BYTES - 1 ? 0 : address - (RC_TARGET_MAX_BYTES - 1)) >> RC_TARGET_PAGE_SHIFT;
+  const uint32_t last_page = last >> RC_TARGET_PAGE_SHIFT;
+  uint32_t page, i;
+
+  if (!num_bytes || !dependencies->num_indirect)
+    return;
+
+  if (last_page - first_page >= dependencies->bucket_mask) {
+    /* more pages than buckets: flag every indirect read */
+    for (i = 0; i < (dependencies->num_modified_memrefs + 31) / 32; ++i)
+      dependencies->update[i] |= dependencies->indirect[i];
+    return;
+  }
+
+  for (page = first_page; ; ++page) {
+    uint32_t k = dependencies->bucket[page & dependencies->bucket_mask];
+    for (; k != RC_TARGET_NONE; k = dependencies->target_next[k]) {
+      const uint32_t target = dependencies->target[k];
+      if (target <= last && (target >= address || address - target < dependencies->target_bytes[k])) {
+        const uint32_t index = dependencies->target_index[k];
+        dependencies->update[index >> 5] |= 1U << (index & 31);
+      }
+    }
+    if (page == last_page)
+      break;
+  }
+}
+
+typedef struct rc_indirect_read_t {
+  rc_read_memory_func_t read_memory;
+  void* ud;
+  uint32_t address;
+  uint32_t num_bytes;
+} rc_indirect_read_t;
+
+static uint32_t RC_CCONV rc_indirect_read(uint32_t address, uint8_t* buffer, uint32_t num_bytes, void* ud) {
+  rc_indirect_read_t* read = (rc_indirect_read_t*)ud;
+  read->address = address;
+  read->num_bytes = num_bytes;
+  return read->read_memory(address, buffer, num_bytes, read->ud);
+}
+
+/* updates the k-th indirect read, and files it under the memory it read. if its inputs did not
+ * change, it only has to be updated again when they or that memory change. */
+static void rc_update_indirect_read(rc_memref_dependencies_t* dependencies, uint32_t k, rc_modified_memref_t* memref,
+                                    rc_read_memory_func_t read_memory, void* ud) {
+  rc_indirect_read_t read;
+  uint16_t* link;
+
+  read.read_memory = read_memory;
+  read.ud = ud;
+  read.num_bytes = 0;
+  rc_update_modified_memref_value(memref, rc_indirect_read, &read);
+  if (read.num_bytes > RC_TARGET_MAX_BYTES)
+    read.num_bytes = 0;
+
+  if (dependencies->target_bytes[k] == read.num_bytes && dependencies->target[k] == read.address) {
+    /* filed there already */
+  }
+  else {
+    if (dependencies->target_bytes[k]) {
+      link = &dependencies->bucket[(dependencies->target[k] >> RC_TARGET_PAGE_SHIFT) & dependencies->bucket_mask];
+      while (*link != k)
+        link = &dependencies->target_next[*link];
+      *link = dependencies->target_next[k];
+    }
+
+    dependencies->target[k] = read.address;
+    dependencies->target_bytes[k] = (uint8_t)read.num_bytes;
+    if (read.num_bytes) {
+      link = &dependencies->bucket[(read.address >> RC_TARGET_PAGE_SHIFT) & dependencies->bucket_mask];
+      dependencies->target_next[k] = *link;
+      *link = (uint16_t)k;
+    }
+  }
+
+  /* not filed (nothing was read): update it every frame */
+  memref->inputs_unchanged = read.num_bytes &&
+      rc_operand_is_unchanged(&memref->parent) && rc_operand_is_unchanged(&memref->modifier);
+}
+
 static uint32_t rc_lowest_bit_index(uint32_t bits) {
 #if defined(__GNUC__)
   return (uint32_t)__builtin_ctz(bits);
@@ -1237,7 +1372,7 @@ void rc_update_modified_memref_values(rc_memrefs_t* memrefs, rc_memref_dependenc
   rc_modified_memref_list_t* modified_memref_list = &memrefs->modified_memrefs;
   uint32_t* update;
   uint32_t* update_next;
-  uint32_t first_index = 0, num_words, word;
+  uint32_t first_index = 0, num_words, word, indirect = 0;
 
   if (!dependencies) {
     if (modified_memref_list->count) {
@@ -1260,6 +1395,14 @@ void rc_update_modified_memref_values(rc_memrefs_t* memrefs, rc_memref_dependenc
   update = dependencies->update;
   update_next = dependencies->update_next;
   num_words = (dependencies->num_modified_memrefs + 31) / 32;
+
+  /* without the memory changes, any indirect read may have changed */
+  if (!dependencies->memory_known) {
+    for (word = 0; word < num_words; ++word)
+      update[word] |= dependencies->indirect[word];
+  }
+  dependencies->memory_known = 0;
+
   for (word = 0; word < num_words; ++word) {
     uint32_t bits;
 
@@ -1277,7 +1420,15 @@ void rc_update_modified_memref_values(rc_memrefs_t* memrefs, rc_memref_dependenc
       }
 
       modified_memref = &modified_memref_list->items[index - first_index];
-      rc_update_modified_memref_value(modified_memref, read_memory, ud);
+      if (dependencies->indirect[word] & bit) {
+        /* indirect reads are visited in list order too */
+        while (dependencies->target_index[indirect] != index)
+          ++indirect;
+        rc_update_indirect_read(dependencies, indirect, modified_memref, read_memory, ud);
+      }
+      else {
+        rc_update_modified_memref_value(modified_memref, read_memory, ud);
+      }
 
       if (modified_memref->memref.value.changed) {
         if (changed)
