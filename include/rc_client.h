@@ -111,6 +111,19 @@ RC_EXPORT void RC_CCONV rc_client_set_spectator_mode_enabled(rc_client_t* client
 RC_EXPORT int RC_CCONV rc_client_get_spectator_mode_enabled(const rc_client_t* client);
 
 /**
+ * Sets whether an achievement is skipped when evaluating it can't change anything: its last
+ * evaluation changed none of its state, and nothing it reads has changed since. The results
+ * (events, state, serialized progress) are the same as with it off; it only saves the repeated
+ * work, at the cost of an index of what each achievement reads. Off by default.
+ */
+RC_EXPORT void RC_CCONV rc_client_set_change_driven_enabled(rc_client_t* client, int enabled);
+
+/**
+ * Gets whether change-driven achievement evaluation is enabled.
+ */
+RC_EXPORT int RC_CCONV rc_client_get_change_driven_enabled(const rc_client_t* client);
+
+/**
  * Attaches client-specific data to the runtime.
  */
 RC_EXPORT void RC_CCONV rc_client_set_userdata(rc_client_t* client, void* userdata);

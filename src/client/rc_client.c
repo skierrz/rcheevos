@@ -1181,8 +1181,12 @@ void rc_client_destroy_all_user_progress(rc_client_all_user_progress_t* list)
 
 /* ===== Game ===== */
 
+static void rc_client_cd_release(rc_client_game_info_t* game);
+
 static void rc_client_free_game(rc_client_game_info_t* game)
 {
+  rc_client_cd_release(game);
+
   rc_runtime_destroy(&game->runtime);
 
   rc_buffer_destroy(&game->buffer);
@@ -1508,6 +1512,8 @@ static void rc_client_toggle_hardcore_achievements(rc_client_game_info_t* game, 
 {
   uint32_t active_count = 0;
   rc_client_subset_info_t* subset = game->subsets;
+
+  rc_client_cd_release(game);
   for (; subset; subset = subset->next) {
     if (subset->active)
       active_count += rc_client_subset_toggle_hardcore_achievements(subset, client, active_bit);
@@ -5989,12 +5995,403 @@ int rc_client_is_processing_required(rc_client_t* client)
   return (client->game->runtime.richpresence && client->game->runtime.richpresence->richpresence);
 }
 
+
+/* ===== Change-driven evaluation ===== */
+
+/* Evaluating a trigger is a function of its state (state, has_hits, measured_value, each group's
+ * is_paused, each condition's current_hits and is_true) and of the values its conditions read; for
+ * rc_client's triggers nothing else (they have no memrefs of their own, and AddSource/AddAddress/
+ * Remember/Recall resolve to memrefs). So if an evaluation changed none of the trigger's state and
+ * returned its state, a later evaluation that reads the same values does the same: skipping it and
+ * returning the state gives the same result, the same state and the same bytes. A memref's value,
+ * delta and prior can only differ from the previous frame's if it changed this frame or the last.
+ *
+ * Per frame, every trigger that reads a memref that changed this frame or the last is stamped with
+ * the frame. A trigger is skipped if its last evaluation was clean (it changed nothing and returned
+ * the state; found by comparing a snapshot of the state taken before it), nothing it reads has been
+ * stamped since, and its state hasn't been changed from outside (resets, unlocks, deserializing and
+ * hardcore toggles also drop the whole index). An evaluation is only checked for being clean if
+ * nothing it reads was stamped this frame, as otherwise the next frame is unlikely to be skipped. */
+
+#define RC_CLIENT_CD_NEVER 1   /* not indexed: always evaluated */
+#define RC_CLIENT_CD_CLEAN 2   /* its last evaluation changed nothing and returned its state */
+
+typedef struct rc_client_cd_slot_t {
+  uint32_t changed;            /* the last frame that something it reads changed */
+  uint32_t evaluated;          /* the frame of its last clean evaluation */
+  uint8_t flags;
+  uint8_t state;               /* trigger->state after its last evaluation */
+} rc_client_cd_slot_t;
+
+typedef struct rc_client_cd_t {
+  uint32_t frame;              /* memref updates since the index was built */
+  uint32_t num_memrefs;        /* memrefs, then modified memrefs, in update order */
+  uint32_t num_slots;          /* achievements, numbered across the subsets in order */
+  uint32_t* memref_offsets;    /* memref i is read by memref_slots[memref_offsets[i] .. memref_offsets[i + 1]) */
+  uint16_t* memref_slots;
+  uint32_t* changed;           /* the memrefs that changed this frame, then the ones of the frame before */
+  uint32_t num_changed;
+  uint32_t num_changed_before;
+  rc_client_cd_slot_t* slots;
+  uint32_t* snapshot_hits;     /* the state of the trigger being evaluated, before evaluating it */
+  uint8_t* snapshot_flags;
+  uint32_t snapshot_size;
+} rc_client_cd_t;
+
+static void rc_client_cd_release(rc_client_game_info_t* game)
+{
+  rc_client_cd_t* cd = game->cd;
+  if (cd) {
+    free(cd->memref_offsets);
+    free(cd->memref_slots);
+    free(cd->changed);
+    free(cd->slots);
+    free(cd->snapshot_hits);
+    free(cd->snapshot_flags);
+    free(cd);
+    game->cd = NULL;
+  }
+}
+
+static uint32_t rc_client_cd_count_memrefs(const rc_memrefs_t* memrefs)
+{
+  const rc_memref_list_t* memref_list = &memrefs->memrefs;
+  const rc_modified_memref_list_t* modified_memref_list = &memrefs->modified_memrefs;
+  uint32_t count = 0;
+  for (; memref_list; memref_list = memref_list->next)
+    count += memref_list->count;
+  for (; modified_memref_list; modified_memref_list = modified_memref_list->next)
+    count += modified_memref_list->count;
+  return count;
+}
+
+static uint32_t rc_client_cd_count_slots(const rc_client_game_info_t* game)
+{
+  const rc_client_subset_info_t* subset;
+  uint32_t count = 0;
+  for (subset = game->subsets; subset; subset = subset->next)
+    count += subset->public_.num_achievements;
+  return count;
+}
+
+/* the memref's index in update order, or UINT32_MAX if it isn't in the game's lists */
+static uint32_t rc_client_cd_memref_index(const rc_memrefs_t* memrefs, const rc_memref_t* memref)
+{
+  const rc_memref_list_t* memref_list = &memrefs->memrefs;
+  const rc_modified_memref_list_t* modified_memref_list = &memrefs->modified_memrefs;
+  uint32_t base = 0;
+  for (; memref_list; memref_list = memref_list->next) {
+    if (memref >= memref_list->items && memref < memref_list->items + memref_list->count)
+      return base + (uint32_t)(memref - memref_list->items);
+    base += memref_list->count;
+  }
+  for (; modified_memref_list; modified_memref_list = modified_memref_list->next) {
+    const rc_modified_memref_t* modified_memref = (const rc_modified_memref_t*)memref;
+    if (modified_memref >= modified_memref_list->items && modified_memref < modified_memref_list->items + modified_memref_list->count)
+      return base + (uint32_t)(modified_memref - modified_memref_list->items);
+    base += modified_memref_list->count;
+  }
+  return UINT32_MAX;
+}
+
+/* the memref an operand reads, or NULL for a constant */
+static const rc_memref_t* rc_client_cd_operand_memref(const rc_operand_t* operand)
+{
+  switch (operand->type) {
+    case RC_OPERAND_CONST:
+    case RC_OPERAND_FP:
+    case RC_OPERAND_FUNC:
+      return NULL;
+
+    case RC_OPERAND_RECALL:
+      if (!rc_operand_type_is_memref(operand->memref_access_type))
+        return NULL;
+      break;
+  }
+  return operand->value.memref;
+}
+
+static int rc_client_cd_is_evaluated(const rc_condition_t* condition)
+{
+  switch (condition->type) {
+    case RC_CONDITION_ADD_SOURCE:
+    case RC_CONDITION_SUB_SOURCE:
+    case RC_CONDITION_ADD_ADDRESS:
+    case RC_CONDITION_REMEMBER:
+      return 0; /* folded into modified memrefs */
+
+    default:
+      return 1;
+  }
+}
+
+/* the conditions of a group that are evaluated, in memory order (the rest are indirect) */
+static rc_condition_t* rc_client_cd_conditions(rc_condset_t* condset, uint32_t* count)
+{
+  *count = (uint32_t)condset->num_pause_conditions + condset->num_reset_conditions + condset->num_hittarget_conditions +
+      condset->num_measured_conditions + condset->num_other_conditions;
+  return condset->conditions ? rc_condset_get_conditions(condset) : NULL;
+}
+
+#define RC_CLIENT_CD_FOR_EACH_CONDSET(trigger, condset) \
+  for (condset = (trigger)->requirement ? (trigger)->requirement : (trigger)->alternative; condset; \
+       condset = (condset == (trigger)->requirement) ? (trigger)->alternative : condset->next)
+
+typedef struct rc_client_cd_build_t {
+  rc_client_cd_t* cd;
+  const rc_memrefs_t* memrefs;
+  uint32_t* last;              /* per memref: 1 + the last slot that counted it */
+  uint32_t* fill;              /* per memref: its count (first pass), then its next free entry */
+} rc_client_cd_build_t;
+
+/* adds the memrefs a trigger reads to the index (pass 0: checks it can be indexed, else returns 0;
+ * pass 1: counts them; pass 2: fills them in) */
+static int rc_client_cd_add_trigger(rc_client_cd_build_t* build, rc_trigger_t* trigger, uint32_t slot, int pass)
+{
+  rc_condset_t* condset;
+  rc_condition_t* condition;
+  const rc_memref_t* memref;
+  uint32_t i, count, size = 2;
+
+  RC_CLIENT_CD_FOR_EACH_CONDSET(trigger, condset) {
+    condition = rc_client_cd_conditions(condset, &count);
+    size += count + 1;
+    for (; count; --count, ++condition) {
+      int operand;
+      if (!rc_client_cd_is_evaluated(condition))
+        continue;
+      for (operand = 0; operand < 2; ++operand) {
+        memref = rc_client_cd_operand_memref(operand ? &condition->operand2 : &condition->operand1);
+        if (!memref)
+          continue;
+        i = rc_client_cd_memref_index(build->memrefs, memref);
+        if (pass == 0) {
+          /* a variable may be updated more than once a frame */
+          if (i == UINT32_MAX || memref->value.memref_type == RC_MEMREF_TYPE_VALUE)
+            return 0;
+        }
+        else if (build->last[i] != slot + 1) {
+          build->last[i] = slot + 1;
+          if (pass == 2)
+            build->cd->memref_slots[build->fill[i]++] = (uint16_t)slot;
+          else
+            build->fill[i]++;
+        }
+      }
+    }
+  }
+
+  if (size > build->cd->snapshot_size)
+    build->cd->snapshot_size = size;
+  return 1;
+}
+
+static rc_client_cd_t* rc_client_cd_build(rc_client_game_info_t* game)
+{
+  rc_client_cd_build_t build;
+  rc_client_cd_t* cd;
+  rc_client_subset_info_t* subset;
+  uint32_t i, total, slot;
+  int pass = 0;
+
+  cd = (rc_client_cd_t*)calloc(1, sizeof(rc_client_cd_t));
+  if (!cd)
+    return NULL;
+
+  memset(&build, 0, sizeof(build));
+  build.cd = cd;
+  build.memrefs = game->runtime.memrefs;
+  cd->num_memrefs = rc_client_cd_count_memrefs(game->runtime.memrefs);
+  cd->num_slots = rc_client_cd_count_slots(game);
+  cd->slots = (rc_client_cd_slot_t*)calloc(cd->num_slots + 1, sizeof(rc_client_cd_slot_t));
+  cd->memref_offsets = (uint32_t*)calloc(cd->num_memrefs + 1, sizeof(uint32_t));
+  cd->changed = (uint32_t*)malloc((cd->num_memrefs * 2 + 1) * sizeof(uint32_t));
+  build.last = (uint32_t*)calloc(cd->num_memrefs + 1, sizeof(uint32_t));
+  build.fill = (uint32_t*)calloc(cd->num_memrefs + 1, sizeof(uint32_t));
+
+  if (cd->slots && cd->memref_offsets && cd->changed && build.last && build.fill && cd->num_slots <= 0xFFFF) {
+    for (pass = 1; pass <= 2; ++pass) {
+      memset(build.last, 0, cd->num_memrefs * sizeof(uint32_t));
+      slot = 0;
+      for (subset = game->subsets; subset; subset = subset->next) {
+        rc_client_achievement_info_t* achievement = subset->achievements;
+        rc_client_achievement_info_t* stop = achievement + subset->public_.num_achievements;
+        for (; achievement < stop; ++achievement, ++slot) {
+          if (pass == 1 && (!achievement->trigger || achievement->trigger->has_memrefs ||
+                            !rc_client_cd_add_trigger(&build, achievement->trigger, slot, 0)))
+            cd->slots[slot].flags = RC_CLIENT_CD_NEVER;
+          if (!(cd->slots[slot].flags & RC_CLIENT_CD_NEVER))
+            rc_client_cd_add_trigger(&build, achievement->trigger, slot, pass);
+        }
+      }
+
+      if (pass == 1) {
+        /* counts -> offsets */
+        total = 0;
+        for (i = 0; i < cd->num_memrefs; ++i) {
+          const uint32_t n = build.fill[i];
+          cd->memref_offsets[i] = build.fill[i] = total;
+          total += n;
+        }
+        cd->memref_offsets[cd->num_memrefs] = total;
+        cd->memref_slots = (uint16_t*)malloc((total + 1) * sizeof(uint16_t));
+        cd->snapshot_hits = (uint32_t*)malloc((cd->snapshot_size + 2) * sizeof(uint32_t));
+        cd->snapshot_flags = (uint8_t*)malloc(cd->snapshot_size + 2);
+        if (!cd->memref_slots || !cd->snapshot_hits || !cd->snapshot_flags)
+          break;
+      }
+    }
+  }
+
+  free(build.last);
+  free(build.fill);
+  game->cd = cd;
+
+  if (pass <= 2) {
+    /* keep the counts, so it isn't retried until they change; evaluate everything */
+    total = cd->num_memrefs;
+    i = cd->num_slots;
+    rc_client_cd_release(game);
+    cd = (rc_client_cd_t*)calloc(1, sizeof(rc_client_cd_t));
+    if (cd) {
+      cd->num_memrefs = total;
+      cd->num_slots = i;
+    }
+    game->cd = cd;
+    return NULL;
+  }
+
+  /* nothing is skipped until it has been evaluated */
+  for (i = 0; i < cd->num_slots; ++i)
+    cd->slots[i].changed = 1;
+  return cd;
+}
+
+/* called before the memref update of each frame */
+static void rc_client_cd_begin_frame(rc_client_t* client)
+{
+  rc_client_game_info_t* game = client->game;
+  rc_client_cd_t* cd = game->cd;
+
+  if (cd && (cd->num_memrefs != rc_client_cd_count_memrefs(game->runtime.memrefs) ||
+             cd->num_slots != rc_client_cd_count_slots(game)))
+    rc_client_cd_release(game);
+
+  if (!game->cd) {
+    cd = rc_client_cd_build(game);
+    if (!cd) {
+      RC_CLIENT_LOG_WARN(client, "Change-driven evaluation: index not built; evaluating every achievement");
+      return;
+    }
+  }
+  if (!cd->slots)
+    return;
+
+  ++cd->frame;
+  memmove(cd->changed + cd->num_memrefs, cd->changed, cd->num_changed * sizeof(uint32_t));
+  cd->num_changed_before = cd->num_changed;
+  cd->num_changed = 0;
+}
+
+/* called after the memref update: stamps the triggers that read a memref that changed this frame or the last */
+static void rc_client_cd_end_memref_update(rc_client_cd_t* cd)
+{
+  const uint32_t* changed = cd->changed;
+  const uint32_t* stop = cd->changed + cd->num_changed;
+  int list;
+  for (list = 0; list < 2; ++list) {
+    for (; changed < stop; ++changed) {
+      const uint16_t* slot = cd->memref_slots + cd->memref_offsets[*changed];
+      const uint16_t* slot_stop = cd->memref_slots + cd->memref_offsets[*changed + 1];
+      for (; slot < slot_stop; ++slot)
+        cd->slots[*slot].changed = cd->frame;
+    }
+    changed = cd->changed + cd->num_memrefs;
+    stop = changed + cd->num_changed_before;
+  }
+}
+
+/* compare 0: takes a snapshot of the trigger's state (0 if it can't); compare 1: returns 1 if it is unchanged */
+static int rc_client_cd_snapshot(rc_client_cd_t* cd, rc_trigger_t* trigger, int compare)
+{
+  rc_condset_t* condset;
+  rc_condition_t* condition;
+  uint32_t* hits = cd->snapshot_hits;
+  uint8_t* flags = cd->snapshot_flags;
+  uint32_t count;
+
+  if (compare) {
+    if (hits[0] != trigger->measured_value || flags[0] != trigger->state || flags[1] != trigger->has_hits)
+      return 0;
+  }
+  else {
+    hits[0] = trigger->measured_value;
+    flags[0] = trigger->state;
+    flags[1] = trigger->has_hits;
+  }
+  ++hits;
+  flags += 2;
+
+  RC_CLIENT_CD_FOR_EACH_CONDSET(trigger, condset) {
+    if (compare) {
+      if (*flags++ != condset->is_paused)
+        return 0;
+    }
+    else {
+      *flags++ = condset->is_paused;
+    }
+    condition = rc_client_cd_conditions(condset, &count);
+    for (; count; --count, ++condition, ++hits, ++flags) {
+      if (compare) {
+        if (*hits != condition->current_hits || *flags != condition->is_true)
+          return 0;
+      }
+      else {
+        *hits = condition->current_hits;
+        *flags = condition->is_true;
+      }
+    }
+  }
+  return 1;
+}
+
+/* rc_evaluate_trigger, or its result without evaluating it if that can't change anything */
+static int rc_client_cd_evaluate_trigger(rc_client_t* client, rc_client_cd_slot_t* slot, rc_trigger_t* trigger)
+{
+  rc_client_cd_t* cd = client->game->cd;
+  int candidate, ret;
+
+  if ((slot->flags & RC_CLIENT_CD_NEVER) || !rc_trigger_state_active(trigger->state)) {
+    /* not indexed, or a state rc_evaluate_trigger doesn't evaluate in */
+    slot->flags &= ~RC_CLIENT_CD_CLEAN;
+    return rc_evaluate_trigger(trigger, rc_client_read_modified_memory_helper, client, NULL);
+  }
+
+  if ((slot->flags & RC_CLIENT_CD_CLEAN) && trigger->state == slot->state &&
+      (int32_t)(slot->changed - slot->evaluated) <= 0)
+    return trigger->state;
+
+  candidate = (slot->changed != cd->frame) && rc_client_cd_snapshot(cd, trigger, 0);
+
+  ret = rc_evaluate_trigger(trigger, rc_client_read_modified_memory_helper, client, NULL);
+
+  slot->flags &= ~RC_CLIENT_CD_CLEAN;
+  if (candidate && ret == trigger->state && rc_client_cd_snapshot(cd, trigger, 1)) {
+    slot->flags |= RC_CLIENT_CD_CLEAN;
+    slot->evaluated = cd->frame;
+  }
+  slot->state = trigger->state;
+  return ret;
+}
+
 static void rc_client_update_memref_values(rc_client_t* client) {
   rc_memrefs_t* memrefs = client->game->runtime.memrefs;
   rc_memref_dependencies_t* dependencies = rc_memrefs_get_dependencies(memrefs);
   rc_memref_list_t* memref_list;
   uint32_t index = 0;
   int invalidated_memref = 0;
+  /* change-driven evaluation: the memrefs that changed */
+  rc_client_cd_t* cd = (client->state.change_driven && client->game->cd && client->game->cd->slots) ? client->game->cd : NULL;
 
   memref_list = &memrefs->memrefs;
   do {
@@ -6017,8 +6414,12 @@ static void rc_client_update_memref_values(rc_client_t* client) {
 
       if (client->state.processing_memref) {
         rc_update_memref_value(&memref->value, value);
-        if (dependencies && memref->value.changed)
-          rc_memref_dependencies_memref_changed(dependencies, index);
+        if (memref->value.changed) {
+          if (dependencies)
+            rc_memref_dependencies_memref_changed(dependencies, index);
+          if (cd)
+            cd->changed[cd->num_changed++] = index;
+        }
       }
       else {
         /* if the peek function cleared the processing_memref, the memref was invalidated */
@@ -6033,18 +6434,23 @@ static void rc_client_update_memref_values(rc_client_t* client) {
 
   client->state.processing_memref = NULL;
 
-  rc_update_modified_memref_values(memrefs, dependencies, rc_client_read_modified_memory_helper, client);
+  /* the modified memrefs that changed are numbered after the memrefs */
+  rc_update_modified_memref_values(memrefs, dependencies, rc_client_read_modified_memory_helper, client,
+                                   cd ? cd->changed : NULL, cd ? &cd->num_changed : NULL, index);
+
+  if (cd)
+    rc_client_cd_end_memref_update(cd);
 
   if (invalidated_memref)
     rc_client_update_active_achievements(client->game);
 }
 
-static void rc_client_do_frame_process_achievements(rc_client_t* client, rc_client_subset_info_t* subset)
+static void rc_client_do_frame_process_achievements(rc_client_t* client, rc_client_subset_info_t* subset, rc_client_cd_slot_t* slot)
 {
   rc_client_achievement_info_t* achievement = subset->achievements;
   rc_client_achievement_info_t* stop = achievement + subset->public_.num_achievements;
 
-  for (; achievement < stop; ++achievement) {
+  for (; achievement < stop; ++achievement, slot += (slot != NULL)) {
     rc_trigger_t* trigger = achievement->trigger;
     int old_state, new_state;
     uint32_t old_measured_value;
@@ -6054,7 +6460,10 @@ static void rc_client_do_frame_process_achievements(rc_client_t* client, rc_clie
 
     old_measured_value = trigger->measured_value;
     old_state = trigger->state;
-    new_state = rc_evaluate_trigger(trigger, rc_client_read_modified_memory_helper, client, NULL);
+    if (slot)
+      new_state = rc_client_cd_evaluate_trigger(client, slot, trigger);
+    else
+      new_state = rc_evaluate_trigger(trigger, rc_client_read_modified_memory_helper, client, NULL);
 
     /* trigger->state doesn't actually change to RESET - RESET just serves as a notification.
      * we don't care about that particular notification, so look at the actual state. */
@@ -6448,17 +6857,26 @@ void rc_client_do_frame(rc_client_t* client)
   if (client->game && !client->game->waiting_for_reset) {
     rc_runtime_richpresence_t* richpresence;
     rc_client_subset_info_t* subset;
+    rc_client_cd_slot_t* slot;
 
     rc_mutex_lock(&client->state.mutex);
 
     rc_client_reset_pending_events(client);
 
+    if (client->state.change_driven)
+      rc_client_cd_begin_frame(client);
+    else if (client->game->cd)
+      rc_client_cd_release(client->game);
+
     rc_client_update_memref_values(client);
 
     client->game->progress_tracker.progress = 0.0;
+    slot = client->game->cd ? client->game->cd->slots : NULL;  /* NULL: evaluate everything */
     for (subset = client->game->subsets; subset; subset = subset->next) {
       if (subset->active)
-        rc_client_do_frame_process_achievements(client, subset);
+        rc_client_do_frame_process_achievements(client, subset, slot);
+      if (slot)
+        slot += subset->public_.num_achievements;
     }
     if (client->game->pending_events & RC_CLIENT_GAME_PENDING_EVENT_PROGRESS_TRACKER)
       rc_client_do_frame_update_progress_tracker(client, client->game);
@@ -6633,6 +7051,7 @@ static void rc_client_reset_variables(rc_client_t* client)
 
 static void rc_client_reset_all(rc_client_t* client)
 {
+  rc_client_cd_release(client->game);
   rc_client_reset_achievements(client);
   rc_client_reset_leaderboards(client);
   rc_client_reset_richpresence(client);
@@ -6900,6 +7319,8 @@ int rc_client_deserialize_progress_sized(rc_client_t* client, const uint8_t* ser
 
   rc_client_hide_progress_tracker(client, client->game);
 
+  rc_client_cd_release(client->game);
+
   if (!serialized) {
     rc_client_reset_all(client);
     result = RC_OK;
@@ -7099,6 +7520,17 @@ int rc_client_get_spectator_mode_enabled(const rc_client_t* client)
 #endif
 
   return (client->state.spectator_mode == RC_CLIENT_SPECTATOR_MODE_OFF) ? 0 : 1;
+}
+
+void rc_client_set_change_driven_enabled(rc_client_t* client, int enabled)
+{
+  if (client)
+    client->state.change_driven = enabled ? 1 : 0;
+}
+
+int rc_client_get_change_driven_enabled(const rc_client_t* client)
+{
+  return client ? client->state.change_driven : 0;
 }
 
 void rc_client_set_userdata(rc_client_t* client, void* userdata)

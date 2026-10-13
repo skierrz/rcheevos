@@ -272,6 +272,8 @@ typedef struct rc_client_game_info_t {
   uint8_t waiting_for_reset;
   uint8_t pending_events;
 
+  struct rc_client_cd_t* cd; /* change-driven evaluation (rc_client.c) */
+
   rc_buffer_t buffer;
 } rc_client_game_info_t;
 
@@ -338,6 +340,7 @@ typedef struct rc_client_state_t {
   uint8_t disconnect;
   uint8_t allow_leaderboards_in_casual;
   uint8_t allow_background_memory_reads;
+  uint8_t change_driven;
 
   struct rc_client_load_state_t* load;
   struct rc_client_async_handle_t* async_handles[4];

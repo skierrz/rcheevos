@@ -1229,8 +1229,11 @@ static uint32_t rc_lowest_bit_index(uint32_t bits) {
 #endif
 }
 
+/* if changed is not NULL, the number of each modified memref that changed (first_number for the
+ * first one in the lists, then counting up) is appended to it, in list order */
 void rc_update_modified_memref_values(rc_memrefs_t* memrefs, rc_memref_dependencies_t* dependencies,
-                                      rc_read_memory_func_t read_memory, void* ud) {
+                                      rc_read_memory_func_t read_memory, void* ud,
+                                      uint32_t* changed, uint32_t* num_changed, uint32_t first_number) {
   rc_modified_memref_list_t* modified_memref_list = &memrefs->modified_memrefs;
   uint32_t* update;
   uint32_t* update_next;
@@ -1242,8 +1245,11 @@ void rc_update_modified_memref_values(rc_memrefs_t* memrefs, rc_memref_dependenc
         rc_modified_memref_t* modified_memref = modified_memref_list->items;
         const rc_modified_memref_t* modified_memref_stop = modified_memref + modified_memref_list->count;
 
-        for (; modified_memref < modified_memref_stop; ++modified_memref)
+        for (; modified_memref < modified_memref_stop; ++modified_memref, ++first_number) {
           rc_update_modified_memref_value(modified_memref, read_memory, ud);
+          if (changed && modified_memref->memref.value.changed)
+            changed[(*num_changed)++] = first_number;
+        }
 
         modified_memref_list = modified_memref_list->next;
       } while (modified_memref_list);
@@ -1274,6 +1280,9 @@ void rc_update_modified_memref_values(rc_memrefs_t* memrefs, rc_memref_dependenc
       rc_update_modified_memref_value(modified_memref, read_memory, ud);
 
       if (modified_memref->memref.value.changed) {
+        if (changed)
+          changed[(*num_changed)++] = first_number + index;
+
         const uint16_t* dependent = dependencies->dependents +
             dependencies->first_dependent[dependencies->num_memrefs + index];
         const uint16_t* dependent_stop = dependencies->dependents +
@@ -1323,5 +1332,5 @@ void rc_update_memref_values(rc_memrefs_t* memrefs, rc_read_memory_func_t read_m
     memref_list = memref_list->next;
   } while (memref_list);
 
-  rc_update_modified_memref_values(memrefs, dependencies, read_memory, ud);
+  rc_update_modified_memref_values(memrefs, dependencies, read_memory, ud, NULL, NULL, 0);
 }
