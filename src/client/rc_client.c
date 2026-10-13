@@ -6165,7 +6165,10 @@ static void rc_client_do_frame_process_achievements(rc_client_t* client, rc_clie
     else {
       old_measured_value = trigger->measured_value;
       old_state = trigger->state;
-      new_state = rc_evaluate_trigger(trigger, rc_client_read_modified_memory_helper, client, NULL);
+      if (client->state.change_driven)
+        new_state = rc_evaluate_trigger_change_driven(trigger, rc_client_read_modified_memory_helper, client, client->state.memref_updates);
+      else
+        new_state = rc_evaluate_trigger(trigger, rc_client_read_modified_memory_helper, client, NULL);
     }
 
     /* trigger->state doesn't actually change to RESET - RESET just serves as a notification.
@@ -6566,6 +6569,7 @@ void rc_client_do_frame(rc_client_t* client)
     rc_client_reset_pending_events(client);
 
     rc_client_update_memref_values(client);
+    ++client->state.memref_updates;
 
     if (client->state.trigger_evaluator.result)
       rc_client_begin_claimed_triggers(client);
@@ -7217,6 +7221,17 @@ int rc_client_get_spectator_mode_enabled(const rc_client_t* client)
 #endif
 
   return (client->state.spectator_mode == RC_CLIENT_SPECTATOR_MODE_OFF) ? 0 : 1;
+}
+
+void rc_client_set_change_driven_enabled(rc_client_t* client, int enabled)
+{
+  if (client)
+    client->state.change_driven = enabled ? 1 : 0;
+}
+
+int rc_client_get_change_driven_enabled(const rc_client_t* client)
+{
+  return client ? client->state.change_driven : 0;
 }
 
 void rc_client_set_userdata(rc_client_t* client, void* userdata)
