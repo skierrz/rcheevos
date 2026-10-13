@@ -643,6 +643,7 @@ static int rc_runtime_progress_read_trigger(rc_runtime_progress_t* progress, rc_
 
   trigger->state = (char)rc_runtime_progress_read_uint(progress);
   trigger->measured_value = rc_runtime_progress_read_uint(progress);
+  trigger->cd_flags = 0;
 
   if (trigger->requirement) {
     result = rc_runtime_progress_read_condset(progress, trigger->requirement);
