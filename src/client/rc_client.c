@@ -6015,6 +6015,8 @@ int rc_client_is_processing_required(rc_client_t* client)
 
 #define RC_CLIENT_CD_NEVER 1   /* not indexed: always evaluated */
 #define RC_CLIENT_CD_CLEAN 2   /* its last evaluation changed nothing and returned its state */
+#define RC_CLIENT_CD_COMPARISON 0x80000000
+#define RC_CLIENT_CD_MAX_SCAN 64 /* comparisons of a memref looked at to find a duplicate */
 
 typedef struct rc_client_cd_slot_t {
   uint32_t changed;            /* the last frame that something it reads changed */
@@ -6027,8 +6029,13 @@ typedef struct rc_client_cd_t {
   uint32_t frame;              /* memref updates since the index was built */
   uint32_t num_memrefs;        /* memrefs, then modified memrefs, in update order */
   uint32_t num_slots;          /* achievements, numbered across the subsets in order */
-  uint32_t* memref_offsets;    /* memref i is read by memref_slots[memref_offsets[i] .. memref_offsets[i + 1]) */
-  uint16_t* memref_slots;
+  uint32_t* memref_offsets;    /* memref i is read by memref_entries[memref_offsets[i] .. memref_offsets[i + 1]): */
+  uint32_t* memref_entries;    /* a slot that reads its value, or RC_CLIENT_CD_COMPARISON | a comparison of it */
+  uint32_t num_comparisons;    /* distinct comparisons of memrefs that triggers' conditions make */
+  rc_condition_t** comparison_condition; /* one of the conditions that make it */
+  uint8_t* comparison_result;  /* its result this frame */
+  uint32_t* comparison_offsets;/* comparison i is in comparison_slots[comparison_offsets[i] .. [i + 1]) */
+  uint16_t* comparison_slots;
   uint32_t* changed;           /* the memrefs that changed this frame, then the ones of the frame before */
   uint32_t num_changed;
   uint32_t num_changed_before;
@@ -6043,7 +6050,11 @@ static void rc_client_cd_release(rc_client_game_info_t* game)
   rc_client_cd_t* cd = game->cd;
   if (cd) {
     free(cd->memref_offsets);
-    free(cd->memref_slots);
+    free(cd->memref_entries);
+    free(cd->comparison_condition);
+    free(cd->comparison_result);
+    free(cd->comparison_offsets);
+    free(cd->comparison_slots);
     free(cd->changed);
     free(cd->slots);
     free(cd->snapshot_hits);
@@ -6137,46 +6148,145 @@ static rc_condition_t* rc_client_cd_conditions(rc_condset_t* condset, uint32_t* 
   for (condset = (trigger)->requirement ? (trigger)->requirement : (trigger)->alternative; condset; \
        condset = (condset == (trigger)->requirement) ? (trigger)->alternative : condset->next)
 
+/* every field rc_test_condition reads is the same */
+static int rc_client_cd_same_operand(const rc_operand_t* left, const rc_operand_t* right)
+{
+  if (left->type != right->type || left->size != right->size || left->memref_access_type != right->memref_access_type)
+    return 0;
+  switch (left->type == RC_OPERAND_RECALL ? left->memref_access_type : left->type) {
+    case RC_OPERAND_CONST:
+    case RC_OPERAND_FUNC:
+      return left->value.num == right->value.num;
+    case RC_OPERAND_FP:
+      return memcmp(&left->value.dbl, &right->value.dbl, sizeof(left->value.dbl)) == 0;
+    default:
+      return left->value.memref == right->value.memref;
+  }
+}
+
+static int rc_client_cd_same_comparison(const rc_condition_t* left, const rc_condition_t* right)
+{
+  return left->oper == right->oper && left->optimized_comparator == right->optimized_comparator &&
+      rc_client_cd_same_operand(&left->operand1, &right->operand1) &&
+      rc_client_cd_same_operand(&left->operand2, &right->operand2);
+}
+
 typedef struct rc_client_cd_build_t {
   rc_client_cd_t* cd;
   const rc_memrefs_t* memrefs;
   uint32_t* last;              /* per memref: 1 + the last slot that counted it */
-  uint32_t* fill;              /* per memref: its count (first pass), then its next free entry */
+  uint32_t* fill;              /* per memref: its count (pass 1), then its next free entry (pass 2) */
+  uint32_t* first;             /* per memref: 1 + its first comparison (as operand1, else operand2) */
+  uint32_t* tail;              /* per memref: 1 + its last comparison */
+  uint32_t* next;              /* per comparison: 1 + the next comparison of the same memref */
+  uint32_t* comparison_last;   /* per comparison: 1 + the last slot that counted it */
+  uint32_t* comparison_fill;   /* per comparison: its count (pass 1), then its next free entry (pass 2) */
+  uint32_t capacity;
 } rc_client_cd_build_t;
 
-/* adds the memrefs a trigger reads to the index (pass 0: checks it can be indexed, else returns 0;
- * pass 1: counts them; pass 2: fills them in) */
+static void rc_client_cd_add_memref(rc_client_cd_build_t* build, uint32_t i, uint32_t entry, int pass)
+{
+  if (pass == 2)
+    build->cd->memref_entries[build->fill[i]++] = entry;
+  else
+    build->fill[i]++;
+}
+
+static int rc_client_cd_grow(void** array, uint32_t capacity, size_t size)
+{
+  void* grown = realloc(*array, capacity * size);
+  if (!grown)
+    return 0;
+  *array = grown;
+  return 1;
+}
+
+/* the index of the comparison a condition makes. Pass 1 adds it if it isn't among the first few of
+ * its memref (in the order added); pass 2 finds the same one. */
+static uint32_t rc_client_cd_comparison(rc_client_cd_build_t* build, rc_condition_t* condition, uint32_t i, uint32_t i2, int pass)
+{
+  rc_client_cd_t* cd = build->cd;
+  uint32_t c = build->first[i], scan = 0, n;
+
+  for (; c; c = build->next[c - 1], ++scan) {
+    if (scan < RC_CLIENT_CD_MAX_SCAN ? rc_client_cd_same_comparison(cd->comparison_condition[c - 1], condition) :
+        cd->comparison_condition[c - 1] == condition)
+      return c - 1;
+    if (scan >= RC_CLIENT_CD_MAX_SCAN && pass == 1)
+      break;
+  }
+
+  n = cd->num_comparisons;
+  if (n == build->capacity) {
+    const uint32_t capacity = n ? n * 2 : 256;
+    if (!rc_client_cd_grow((void**)&cd->comparison_condition, capacity, sizeof(rc_condition_t*)) ||
+        !rc_client_cd_grow((void**)&build->next, capacity, sizeof(uint32_t)) ||
+        !rc_client_cd_grow((void**)&build->comparison_last, capacity, sizeof(uint32_t)) ||
+        !rc_client_cd_grow((void**)&build->comparison_fill, capacity, sizeof(uint32_t)))
+      return UINT32_MAX;
+    build->capacity = capacity;
+  }
+  cd->comparison_condition[n] = condition;
+  build->comparison_last[n] = build->comparison_fill[n] = build->next[n] = 0;
+  if (build->first[i])
+    build->next[build->tail[i] - 1] = n + 1;
+  else
+    build->first[i] = n + 1;
+  build->tail[i] = n + 1;
+  build->fill[i]++;
+  if (i2 != UINT32_MAX && i2 != i)
+    build->fill[i2]++;
+  cd->num_comparisons = n + 1;
+  return n;
+}
+
+/* adds what a trigger reads to the index (pass 0: checks it can be indexed, else returns 0;
+ * pass 1: counts; pass 2: fills in). A condition makes a comparison, unless it is Measured without
+ * a hit target, which reads the values. */
 static int rc_client_cd_add_trigger(rc_client_cd_build_t* build, rc_trigger_t* trigger, uint32_t slot, int pass)
 {
   rc_condset_t* condset;
   rc_condition_t* condition;
-  const rc_memref_t* memref;
-  uint32_t i, count, size = 2;
+  const rc_memref_t* memref[2];
+  uint32_t i[2], c, count, size = 2;
+  int operand;
 
   RC_CLIENT_CD_FOR_EACH_CONDSET(trigger, condset) {
     condition = rc_client_cd_conditions(condset, &count);
     size += count + 1;
     for (; count; --count, ++condition) {
-      int operand;
       if (!rc_client_cd_is_evaluated(condition))
         continue;
       for (operand = 0; operand < 2; ++operand) {
-        memref = rc_client_cd_operand_memref(operand ? &condition->operand2 : &condition->operand1);
-        if (!memref)
-          continue;
-        i = rc_client_cd_memref_index(build->memrefs, memref);
-        if (pass == 0) {
-          /* a variable may be updated more than once a frame */
-          if (i == UINT32_MAX || memref->value.memref_type == RC_MEMREF_TYPE_VALUE)
-            return 0;
+        memref[operand] = rc_client_cd_operand_memref(operand ? &condition->operand2 : &condition->operand1);
+        i[operand] = memref[operand] ? rc_client_cd_memref_index(build->memrefs, memref[operand]) : UINT32_MAX;
+        /* a variable may be updated more than once a frame */
+        if (pass == 0 && memref[operand] && (i[operand] == UINT32_MAX || memref[operand]->value.memref_type == RC_MEMREF_TYPE_VALUE))
+          return 0;
+      }
+      if (pass == 0 || (!memref[0] && !memref[1]))
+        continue;
+
+      if (condition->type == RC_CONDITION_MEASURED && condition->required_hits == 0) {
+        for (operand = 0; operand < 2; ++operand) {
+          if (memref[operand] && build->last[i[operand]] != slot + 1) {
+            build->last[i[operand]] = slot + 1;
+            rc_client_cd_add_memref(build, i[operand], slot, pass);
+          }
         }
-        else if (build->last[i] != slot + 1) {
-          build->last[i] = slot + 1;
-          if (pass == 2)
-            build->cd->memref_slots[build->fill[i]++] = (uint16_t)slot;
-          else
-            build->fill[i]++;
-        }
+        continue;
+      }
+
+      c = memref[0] ? rc_client_cd_comparison(build, condition, i[0], i[1], pass) :
+                      rc_client_cd_comparison(build, condition, i[1], UINT32_MAX, pass);
+      if (c == UINT32_MAX)
+        return 0;
+      if (build->comparison_last[c] != slot + 1) {
+        build->comparison_last[c] = slot + 1;
+        if (pass == 2)
+          build->cd->comparison_slots[build->comparison_fill[c]++] = (uint16_t)slot;
+        else
+          build->comparison_fill[c]++;
       }
     }
   }
@@ -6191,8 +6301,8 @@ static rc_client_cd_t* rc_client_cd_build(rc_client_game_info_t* game)
   rc_client_cd_build_t build;
   rc_client_cd_t* cd;
   rc_client_subset_info_t* subset;
-  uint32_t i, total, slot;
-  int pass = 0;
+  uint32_t i, n, total, slot;
+  int pass = 0, ok = 1;
 
   cd = (rc_client_cd_t*)calloc(1, sizeof(rc_client_cd_t));
   if (!cd)
@@ -6208,46 +6318,77 @@ static rc_client_cd_t* rc_client_cd_build(rc_client_game_info_t* game)
   cd->changed = (uint32_t*)malloc((cd->num_memrefs * 2 + 1) * sizeof(uint32_t));
   build.last = (uint32_t*)calloc(cd->num_memrefs + 1, sizeof(uint32_t));
   build.fill = (uint32_t*)calloc(cd->num_memrefs + 1, sizeof(uint32_t));
+  build.first = (uint32_t*)calloc(cd->num_memrefs + 1, sizeof(uint32_t));
+  build.tail = (uint32_t*)calloc(cd->num_memrefs + 1, sizeof(uint32_t));
 
-  if (cd->slots && cd->memref_offsets && cd->changed && build.last && build.fill && cd->num_slots <= 0xFFFF) {
-    for (pass = 1; pass <= 2; ++pass) {
+  if (cd->slots && cd->memref_offsets && cd->changed && build.last && build.fill && build.first && build.tail && cd->num_slots <= 0xFFFF) {
+    for (pass = 1; pass <= 2 && ok; ++pass) {
       memset(build.last, 0, cd->num_memrefs * sizeof(uint32_t));
+      for (i = 0; i < cd->num_comparisons; ++i)
+        build.comparison_last[i] = 0;
       slot = 0;
-      for (subset = game->subsets; subset; subset = subset->next) {
+      for (subset = game->subsets; subset && ok; subset = subset->next) {
         rc_client_achievement_info_t* achievement = subset->achievements;
         rc_client_achievement_info_t* stop = achievement + subset->public_.num_achievements;
-        for (; achievement < stop; ++achievement, ++slot) {
+        for (; achievement < stop && ok; ++achievement, ++slot) {
           if (pass == 1 && (!achievement->trigger || achievement->trigger->has_memrefs ||
                             !rc_client_cd_add_trigger(&build, achievement->trigger, slot, 0)))
             cd->slots[slot].flags = RC_CLIENT_CD_NEVER;
           if (!(cd->slots[slot].flags & RC_CLIENT_CD_NEVER))
-            rc_client_cd_add_trigger(&build, achievement->trigger, slot, pass);
+            ok = rc_client_cd_add_trigger(&build, achievement->trigger, slot, pass);
         }
       }
 
-      if (pass == 1) {
+      if (pass == 1 && ok) {
         /* counts -> offsets */
         total = 0;
         for (i = 0; i < cd->num_memrefs; ++i) {
-          const uint32_t n = build.fill[i];
+          n = build.fill[i];
           cd->memref_offsets[i] = build.fill[i] = total;
           total += n;
         }
         cd->memref_offsets[cd->num_memrefs] = total;
-        cd->memref_slots = (uint16_t*)malloc((total + 1) * sizeof(uint16_t));
+        cd->memref_entries = (uint32_t*)malloc((total + 1) * sizeof(uint32_t));
+        cd->comparison_offsets = (uint32_t*)malloc((cd->num_comparisons + 1) * sizeof(uint32_t));
+        cd->comparison_result = (uint8_t*)calloc(cd->num_comparisons + 1, 1);
+        total = 0;
+        for (i = 0; i < cd->num_comparisons && cd->comparison_offsets; ++i) {
+          n = build.comparison_fill[i];
+          cd->comparison_offsets[i] = build.comparison_fill[i] = total;
+          total += n;
+        }
+        cd->comparison_slots = (uint16_t*)malloc((total + 1) * sizeof(uint16_t));
         cd->snapshot_hits = (uint32_t*)malloc((cd->snapshot_size + 2) * sizeof(uint32_t));
         cd->snapshot_flags = (uint8_t*)malloc(cd->snapshot_size + 2);
-        if (!cd->memref_slots || !cd->snapshot_hits || !cd->snapshot_flags)
-          break;
+        ok = cd->memref_entries && cd->comparison_offsets && cd->comparison_result && cd->comparison_slots &&
+             cd->snapshot_hits && cd->snapshot_flags;
+        if (ok) {
+          cd->comparison_offsets[cd->num_comparisons] = total;
+          /* the comparisons go first in each memref's entries */
+          for (i = 0; i < cd->num_comparisons; ++i) {
+            const rc_condition_t* condition = cd->comparison_condition[i];
+            const rc_memref_t* memref1 = rc_client_cd_operand_memref(&condition->operand1);
+            const rc_memref_t* memref2 = rc_client_cd_operand_memref(&condition->operand2);
+            if (memref1)
+              rc_client_cd_add_memref(&build, rc_client_cd_memref_index(build.memrefs, memref1), RC_CLIENT_CD_COMPARISON | i, 2);
+            if (memref2 && memref2 != memref1)
+              rc_client_cd_add_memref(&build, rc_client_cd_memref_index(build.memrefs, memref2), RC_CLIENT_CD_COMPARISON | i, 2);
+          }
+        }
       }
     }
   }
 
   free(build.last);
   free(build.fill);
+  free(build.first);
+  free(build.tail);
+  free(build.next);
+  free(build.comparison_last);
+  free(build.comparison_fill);
   game->cd = cd;
 
-  if (pass <= 2) {
+  if (pass <= 2 || !ok) {
     /* keep the counts, so it isn't retried until they change; evaluate everything */
     total = cd->num_memrefs;
     i = cd->num_slots;
@@ -6293,18 +6434,48 @@ static void rc_client_cd_begin_frame(rc_client_t* client)
   cd->num_changed = 0;
 }
 
-/* called after the memref update: stamps the triggers that read a memref that changed this frame or the last */
+static void rc_client_cd_test_comparison(rc_client_cd_t* cd, uint32_t i)
+{
+  rc_eval_state_t eval_state;
+  uint8_t result;
+  memset(&eval_state, 0, sizeof(eval_state));
+  result = (uint8_t)rc_test_condition(cd->comparison_condition[i], &eval_state);
+  if (result != cd->comparison_result[i]) {
+    const uint16_t* slot = cd->comparison_slots + cd->comparison_offsets[i];
+    const uint16_t* slot_stop = cd->comparison_slots + cd->comparison_offsets[i + 1];
+    cd->comparison_result[i] = result;
+    for (; slot < slot_stop; ++slot)
+      cd->slots[*slot].changed = cd->frame;
+  }
+}
+
+/* called after the memref update. A comparison's result, and a memref's value, delta and prior, can
+ * only differ from the previous frame's if a memref it reads changed this frame or the last: retest
+ * those comparisons, and stamp the triggers whose comparison results or values may have changed.
+ * On the first frame, every comparison is tested (the triggers are all stamped anyway). */
 static void rc_client_cd_end_memref_update(rc_client_cd_t* cd)
 {
   const uint32_t* changed = cd->changed;
   const uint32_t* stop = cd->changed + cd->num_changed;
   int list;
+
+  if (cd->frame == 1) {
+    uint32_t i;
+    for (i = 0; i < cd->num_comparisons; ++i)
+      rc_client_cd_test_comparison(cd, i);
+    return;
+  }
+
   for (list = 0; list < 2; ++list) {
     for (; changed < stop; ++changed) {
-      const uint16_t* slot = cd->memref_slots + cd->memref_offsets[*changed];
-      const uint16_t* slot_stop = cd->memref_slots + cd->memref_offsets[*changed + 1];
-      for (; slot < slot_stop; ++slot)
-        cd->slots[*slot].changed = cd->frame;
+      const uint32_t* entry = cd->memref_entries + cd->memref_offsets[*changed];
+      const uint32_t* entry_stop = cd->memref_entries + cd->memref_offsets[*changed + 1];
+      for (; entry < entry_stop; ++entry) {
+        if (*entry & RC_CLIENT_CD_COMPARISON)
+          rc_client_cd_test_comparison(cd, *entry & ~RC_CLIENT_CD_COMPARISON);
+        else
+          cd->slots[*entry].changed = cd->frame;
+      }
     }
     changed = cd->changed + cd->num_memrefs;
     stop = changed + cd->num_changed_before;
