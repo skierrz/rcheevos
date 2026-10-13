@@ -49,9 +49,7 @@ void rc_parse_trigger_internal(rc_trigger_t* self, const char** memaddr, rc_pars
   self->has_memrefs = 0;
   self->cd_flags = 0;
   self->cd_state = 0;
-  self->cd_indexed = 0;
   self->cd_frame = 0;
-  self->cd_changed = 0;
 }
 
 int rc_trigger_size(const char* memaddr) {
@@ -363,9 +361,10 @@ void rc_reset_trigger(rc_trigger_t* self) {
  * same bytes. A skipped frame keeps the trigger clean, so it stays skipped
  * until a memref it reads changes.
  *
- * The caller (rc_client) keeps the dependencies: its memref pass stores the
- * update's number in cd_changed of every indexed trigger that reads a memref
- * that changed. frame: that number for this update. A trigger not evaluated
+ * The caller (rc_client) keeps the dependencies: its memref pass records, per
+ * achievement, the last update that changed a memref it reads. frame: this
+ * update's number; changed: that record for this trigger (frame if it has
+ * none, so it is never skipped). A trigger not evaluated
  * on the update before (cd_frame != frame - 1) isn't skipped. Any other
  * change to a trigger's state goes through rc_reset_trigger or the progress
  * reader (they clear cd_flags) or changes trigger->state (checked against
@@ -462,19 +461,19 @@ static int rc_trigger_snapshot(const rc_trigger_t* self, rc_trigger_snapshot_t* 
   return 1;
 }
 
-int rc_evaluate_trigger_change_driven(rc_trigger_t* self, rc_read_memory_func_t read_memory, void* ud, uint32_t frame) {
+int rc_evaluate_trigger_change_driven(rc_trigger_t* self, rc_read_memory_func_t read_memory, void* ud, uint32_t frame, uint32_t changed) {
   rc_trigger_snapshot_t snapshot;
   int unchanged, have_snapshot, ret;
 
-  if (self->has_memrefs || !self->cd_indexed || !rc_trigger_state_active(self->state)) {
-    /* not a candidate: its own memrefs, no dependency index, or a state rc_evaluate_trigger handles without evaluating */
+  if (self->has_memrefs || !rc_trigger_state_active(self->state)) {
+    /* not a candidate: its own memrefs, or a state rc_evaluate_trigger handles without evaluating */
     self->cd_flags = 0;
     return rc_evaluate_trigger(self, read_memory, ud, NULL);
   }
 
-  unchanged = (self->cd_changed != frame);
+  unchanged = (changed != frame);
 
-  if (unchanged && self->cd_changed != frame - 1 && self->cd_frame == frame - 1 &&
+  if (unchanged && changed != frame - 1 && self->cd_frame == frame - 1 &&
       (self->cd_flags & RC_CD_CLEAN) && self->state == self->cd_state) {
     self->cd_frame = frame;
     return self->state;
