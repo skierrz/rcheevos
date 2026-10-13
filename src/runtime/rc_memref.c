@@ -23,7 +23,154 @@ union rc_bigendian_check_t {
 static const union rc_bigendian_check_t host_bigendian_check = { 0x01000000 };
 static uint8_t rc_is_host_bigendian() { return host_bigendian_check.u8[0]; }
 
+/* memref deduplication looks up each new memref in every existing one. for lists created by
+ * rc_memrefs_init (a runtime's shared list, which can hold thousands of entries), a hash index
+ * replaces the linear scan. the hash covers only fields that the matching logic compares, so
+ * entries that match always share a hash; and with linear probing and no removals, entries with
+ * the same hash are probed in the order they were added (list order), so a lookup returns the
+ * same entry the linear scan would. */
+/* how deep the hash follows modified memrefs. deeper only separates more pointer chains. */
+#define RC_MEMREF_HASH_LEVELS 2
+
+static uint32_t rc_memref_hash_mix(uint32_t hash, uint32_t value) {
+  return (hash ^ value) * 0x9E3779B1;
+}
+
+static uint32_t rc_memref_hash_modifiers(uint32_t hash, const rc_operand_t* parent,
+                                         uint8_t modifier_type, const rc_operand_t* modifier, int levels);
+
+/* hashes what rc_operands_are_equal compares (but no floating point values, as 0.0 == -0.0),
+ * following modified memrefs at most levels deep */
+static uint32_t rc_memref_hash_operand(const rc_operand_t* operand, int levels) {
+  uint32_t hash = operand->type;
+  const rc_memref_t* memref;
+
+  switch (operand->type) {
+    case RC_OPERAND_CONST:
+      return rc_memref_hash_mix(hash, operand->value.num);
+    case RC_OPERAND_FP:
+      return hash;
+    case RC_OPERAND_RECALL:
+      hash = rc_memref_hash_mix(hash, operand->memref_access_type);
+      if (operand->memref_access_type == RC_OPERAND_CONST)
+        return rc_memref_hash_mix(hash, operand->value.num);
+      if (operand->memref_access_type == RC_OPERAND_FP)
+        return hash;
+      break;
+    default:
+      break;
+  }
+
+  hash = rc_memref_hash_mix(hash, operand->size);
+  memref = operand->value.memref;
+  if (!memref)
+    return hash;
+
+  hash = rc_memref_hash_mix(hash, memref->value.memref_type);
+  switch (memref->value.memref_type) {
+    case RC_MEMREF_TYPE_MEMREF:
+      hash = rc_memref_hash_mix(hash, memref->address);
+      return rc_memref_hash_mix(hash, memref->value.size);
+    case RC_MEMREF_TYPE_MODIFIED_MEMREF: {
+      const rc_modified_memref_t* modified_memref = (const rc_modified_memref_t*)memref;
+      if (levels == 0)
+        return hash;
+      return rc_memref_hash_modifiers(hash, &modified_memref->parent, modified_memref->modifier_type,
+                                      &modified_memref->modifier, levels - 1);
+    }
+    default:
+      return hash;
+  }
+}
+
+static uint32_t rc_memref_hash_modifiers(uint32_t hash, const rc_operand_t* parent,
+                                         uint8_t modifier_type, const rc_operand_t* modifier, int levels) {
+  hash = rc_memref_hash_mix(hash, modifier_type);
+  hash = rc_memref_hash_mix(hash, rc_memref_hash_operand(parent, levels));
+  return rc_memref_hash_mix(hash, rc_memref_hash_operand(modifier, levels));
+}
+
+static uint32_t rc_memref_hash(uint32_t address, uint8_t size) {
+  const uint32_t hash = rc_memref_hash_mix(rc_memref_hash_mix(RC_MEMREF_TYPE_MEMREF, address), size);
+  return hash ^ (hash >> 16);
+}
+
+static uint32_t rc_modified_memref_hash(uint8_t size, const rc_operand_t* parent,
+                                        uint8_t modifier_type, const rc_operand_t* modifier) {
+  const uint32_t hash = rc_memref_hash_modifiers(rc_memref_hash_mix(RC_MEMREF_TYPE_MODIFIED_MEMREF, size),
+                                                 parent, modifier_type, modifier, RC_MEMREF_HASH_LEVELS);
+  return hash ^ (hash >> 16);
+}
+
+static void rc_memrefs_index_insert(rc_memrefs_t* memrefs, rc_memref_t* memref) {
+  const uint32_t mask = memrefs->index_capacity - 1;
+  uint32_t slot;
+
+  if (memref->value.memref_type == RC_MEMREF_TYPE_MODIFIED_MEMREF) {
+    const rc_modified_memref_t* modified_memref = (const rc_modified_memref_t*)memref;
+    slot = rc_modified_memref_hash(memref->value.size, &modified_memref->parent,
+                                   modified_memref->modifier_type, &modified_memref->modifier);
+  }
+  else {
+    slot = rc_memref_hash(memref->address, memref->value.size);
+  }
+
+  for (slot &= mask; memrefs->index[slot]; slot = (slot + 1) & mask)
+    ;
+
+  memrefs->index[slot] = memref;
+  memrefs->index_count++;
+}
+
+/* (re)builds the index from the lists, in list order. leaves no index if out of memory. */
+static void rc_memrefs_index_build(rc_memrefs_t* memrefs) {
+  const uint32_t count = rc_memrefs_count_memrefs(memrefs) + rc_memrefs_count_modified_memrefs(memrefs);
+  rc_memref_list_t* memref_list;
+  rc_modified_memref_list_t* modified_memref_list;
+  uint32_t i;
+
+  free(memrefs->index);
+  memrefs->index_count = 0;
+  memrefs->index_capacity = 64;
+  while (count * 4 >= memrefs->index_capacity * 3) /* keep the index at most 3/4 full */
+    memrefs->index_capacity <<= 1;
+
+  memrefs->index = (rc_memref_t**)calloc(memrefs->index_capacity, sizeof(rc_memref_t*));
+  if (!memrefs->index)
+    return;
+
+  for (memref_list = &memrefs->memrefs; memref_list; memref_list = memref_list->next) {
+    for (i = 0; i < memref_list->count; ++i)
+      rc_memrefs_index_insert(memrefs, &memref_list->items[i]);
+  }
+
+  for (modified_memref_list = &memrefs->modified_memrefs; modified_memref_list; modified_memref_list = modified_memref_list->next) {
+    for (i = 0; i < modified_memref_list->count; ++i)
+      rc_memrefs_index_insert(memrefs, &modified_memref_list->items[i].memref);
+  }
+}
+
+/* returns the index for a list created by rc_memrefs_init (freed by rc_memrefs_destroy), else NULL */
+static rc_memref_t** rc_memrefs_get_index(rc_memrefs_t* memrefs) {
+  if (!memrefs->index && memrefs->memrefs.allocated)
+    rc_memrefs_index_build(memrefs);
+
+  return memrefs->index;
+}
+
+/* adds a new entry (already in its list) to the index, if the list has one */
+static void rc_memrefs_index_add(rc_memrefs_t* memrefs, rc_memref_t* memref) {
+  if (!memrefs->index)
+    return;
+
+  if ((memrefs->index_count + 1) * 4 >= memrefs->index_capacity * 3)
+    rc_memrefs_index_build(memrefs);
+  else
+    rc_memrefs_index_insert(memrefs, memref);
+}
+
 rc_memref_t* rc_alloc_memref(rc_parse_state_t* parse, uint32_t address, uint8_t size) {
+  rc_memrefs_t* memrefs;
   rc_memref_list_t* memref_list = NULL;
   rc_memref_t* memref = NULL;
   int i;
@@ -33,12 +180,26 @@ rc_memref_t* rc_alloc_memref(rc_parse_state_t* parse, uint32_t address, uint8_t 
       if (!parse->existing_memrefs)
         continue;
 
-      memref_list = &parse->existing_memrefs->memrefs;
+      memrefs = parse->existing_memrefs;
     }
     else {
-      memref_list = &parse->memrefs->memrefs;
+      memrefs = parse->memrefs;
     }
 
+    if (rc_memrefs_get_index(memrefs)) {
+      const uint32_t mask = memrefs->index_capacity - 1;
+      uint32_t slot = rc_memref_hash(address, size) & mask;
+
+      for (; (memref = memrefs->index[slot]) != NULL; slot = (slot + 1) & mask) {
+        if (memref->value.memref_type == RC_MEMREF_TYPE_MEMREF &&
+            memref->address == address && memref->value.size == size)
+          return memref;
+      }
+
+      continue;
+    }
+
+    memref_list = &memrefs->memrefs;
     do
     {
       const rc_memref_t* memref_stop;
@@ -102,11 +263,13 @@ rc_memref_t* rc_alloc_memref(rc_parse_state_t* parse, uint32_t address, uint8_t 
   memref->value.size = size;
   memref->address = address;
 
+  rc_memrefs_index_add(parse->memrefs, memref);
   return memref;
 }
 
 rc_modified_memref_t* rc_alloc_modified_memref(rc_parse_state_t* parse, uint8_t size, const rc_operand_t* parent,
                                                uint8_t modifier_type, const rc_operand_t* modifier) {
+  rc_memrefs_t* memrefs;
   rc_modified_memref_list_t* modified_memref_list = NULL;
   rc_modified_memref_t* modified_memref = NULL;
   int i = 0;
@@ -116,12 +279,32 @@ rc_modified_memref_t* rc_alloc_modified_memref(rc_parse_state_t* parse, uint8_t 
       if (!parse->existing_memrefs)
         continue;
 
-      modified_memref_list = &parse->existing_memrefs->modified_memrefs;
+      memrefs = parse->existing_memrefs;
     }
     else {
-      modified_memref_list = &parse->memrefs->modified_memrefs;
+      memrefs = parse->memrefs;
     }
 
+    if (rc_memrefs_get_index(memrefs)) {
+      const uint32_t mask = memrefs->index_capacity - 1;
+      uint32_t slot = rc_modified_memref_hash(size, parent, modifier_type, modifier) & mask;
+      rc_memref_t* memref;
+
+      for (; (memref = memrefs->index[slot]) != NULL; slot = (slot + 1) & mask) {
+        modified_memref = (rc_modified_memref_t*)memref;
+        if (memref->value.memref_type == RC_MEMREF_TYPE_MODIFIED_MEMREF &&
+            modified_memref->memref.value.size == size &&
+            modified_memref->modifier_type == modifier_type &&
+            rc_operands_are_equal(&modified_memref->parent, parent) &&
+            rc_operands_are_equal(&modified_memref->modifier, modifier)) {
+          return modified_memref;
+        }
+      }
+
+      continue;
+    }
+
+    modified_memref_list = &memrefs->modified_memrefs;
     do {
       const rc_modified_memref_t* memref_stop;
 
@@ -197,6 +380,7 @@ rc_modified_memref_t* rc_alloc_modified_memref(rc_parse_state_t* parse, uint8_t 
     modified_memref->depth = parent_modified_memref->depth + 1;
   }
 
+  rc_memrefs_index_add(parse->memrefs, &modified_memref->memref);
   return modified_memref;
 }
 
@@ -246,6 +430,7 @@ void rc_memrefs_destroy(rc_memrefs_t* memrefs)
     }
   } while (modified_memref_list);
 
+  free(memrefs->index);
   free(memrefs);
 }
 

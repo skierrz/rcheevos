@@ -77,6 +77,14 @@ typedef struct rc_memrefs_t {
 
   /* The list of derived memory references. */
   rc_modified_memref_list_t modified_memrefs;
+
+  /* Hash index of both lists, to find an existing memref without scanning them.
+   * Only for lists created by rc_memrefs_init. */
+  rc_memref_t** index;
+  /* Number of slots in index (a power of 2). */
+  uint32_t index_capacity;
+  /* Number of entries in index. */
+  uint32_t index_count;
 } rc_memrefs_t;
 
 /*****************************************************************************\
