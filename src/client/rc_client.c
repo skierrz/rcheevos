@@ -1185,6 +1185,7 @@ static void rc_client_free_game(rc_client_game_info_t* game)
 {
   free(game->cd_deps);
   free(game->cd_offsets);
+  free(game->cd_changed);
 
   rc_runtime_destroy(&game->runtime);
 
@@ -6034,7 +6035,6 @@ static uint32_t rc_client_cd_memref_index(const rc_memrefs_t* memrefs, const rc_
 
 typedef struct rc_client_cd_build_t {
   rc_client_game_info_t* game;
-  rc_trigger_t* trigger;
   uint32_t* last;     /* per memref: 1 + the index of the last trigger that counted it (dedupe) */
   uint32_t* fill;     /* per memref: next free entry (second pass), or the count (first pass) */
   uint32_t trigger_index;
@@ -6053,7 +6053,7 @@ static void rc_client_cd_add_dependency(rc_memref_t* memref, void* userdata) {
     return;
   build->last[i] = build->trigger_index + 1;
   if (build->second_pass)
-    build->game->cd_deps[build->fill[i]++] = build->trigger;
+    build->game->cd_deps[build->fill[i]++] = (uint16_t)build->trigger_index;
   else
     build->fill[i]++;
 }
@@ -6068,10 +6068,17 @@ static void rc_client_cd_build_index(rc_client_t* client, rc_client_game_info_t*
 
   free(game->cd_deps);
   free(game->cd_offsets);
+  free(game->cd_changed);
   game->cd_deps = NULL;
   game->cd_offsets = NULL;
   game->cd_memrefs = count = rc_client_cd_count_memrefs(game->runtime.memrefs);
   game->cd_achievements = rc_client_cd_count_achievements(game);
+  /* every slot starts changed now: nothing is skipped before two quiet updates */
+  game->cd_changed = (uint32_t*)malloc((game->cd_achievements ? game->cd_achievements : 1) * sizeof(uint32_t));
+  if (game->cd_changed) {
+    for (i = 0; i < game->cd_achievements; ++i)
+      game->cd_changed[i] = client->state.memref_updates;
+  }
 
   memset(&build, 0, sizeof(build));
   build.game = game;
@@ -6079,7 +6086,7 @@ static void rc_client_cd_build_index(rc_client_t* client, rc_client_game_info_t*
   build.fill = (uint32_t*)calloc(count + 1, sizeof(uint32_t));
   game->cd_offsets = (uint32_t*)calloc(count + 1, sizeof(uint32_t));
 
-  for (pass = 0; pass < 2 && build.last && build.fill && game->cd_offsets; ++pass) {
+  for (pass = 0; pass < 2 && build.last && build.fill && game->cd_offsets && game->cd_changed && game->cd_achievements <= 0xFFFF; ++pass) {
     build.second_pass = pass;
     build.trigger_index = 0;
     if (pass) {
@@ -6092,7 +6099,6 @@ static void rc_client_cd_build_index(rc_client_t* client, rc_client_game_info_t*
       for (; achievement < stop; ++achievement, ++build.trigger_index) {
         if (!achievement->trigger || achievement->trigger->has_memrefs)
           continue;
-        build.trigger = achievement->trigger;
         rc_trigger_enum_dependencies(achievement->trigger, rc_client_cd_add_dependency, &build);
       }
     }
@@ -6107,7 +6113,7 @@ static void rc_client_cd_build_index(rc_client_t* client, rc_client_game_info_t*
         total += n;
       }
       game->cd_offsets[count] = total;
-      game->cd_deps = (rc_trigger_t**)malloc((total ? total : 1) * sizeof(rc_trigger_t*));
+      game->cd_deps = (uint16_t*)malloc((total ? total : 1) * sizeof(uint16_t));
       if (!game->cd_deps)
         break;
     }
@@ -6124,26 +6130,23 @@ static void rc_client_cd_build_index(rc_client_t* client, rc_client_game_info_t*
     RC_CLIENT_LOG_WARN(client, "Change-driven evaluation: dependency index not built; evaluating every achievement");
   }
 
-  /* every trigger starts unskippable: changed now, not clean */
+  /* no trigger is clean yet */
   for (subset = game->subsets; subset; subset = subset->next) {
     rc_client_achievement_info_t* achievement = subset->achievements;
     rc_client_achievement_info_t* stop = achievement + subset->public_.num_achievements;
     for (; achievement < stop; ++achievement) {
-      rc_trigger_t* trigger = achievement->trigger;
-      if (!trigger)
-        continue;
-      trigger->cd_indexed = (game->cd_deps && !trigger->has_memrefs) ? 1 : 0;
-      trigger->cd_changed = client->state.memref_updates;
-      trigger->cd_flags = 0;
+      if (achievement->trigger)
+        achievement->trigger->cd_flags = 0;
     }
   }
 }
 
 static void rc_client_cd_mark(rc_client_game_info_t* game, uint32_t i, uint32_t frame) {
-  rc_trigger_t** dep = game->cd_deps + game->cd_offsets[i];
-  rc_trigger_t** stop = game->cd_deps + game->cd_offsets[i + 1];
+  const uint16_t* dep = game->cd_deps + game->cd_offsets[i];
+  const uint16_t* stop = game->cd_deps + game->cd_offsets[i + 1];
+  uint32_t* changed = game->cd_changed;
   for (; dep < stop; ++dep)
-    (*dep)->cd_changed = frame;
+    changed[*dep] = frame;
 }
 
 static void rc_client_update_memref_values(rc_client_t* client) {
@@ -6208,12 +6211,12 @@ static void rc_client_update_memref_values(rc_client_t* client) {
     rc_client_update_active_achievements(client->game);
 }
 
-static void rc_client_do_frame_process_achievements(rc_client_t* client, rc_client_subset_info_t* subset)
+static void rc_client_do_frame_process_achievements(rc_client_t* client, rc_client_subset_info_t* subset, uint32_t slot)
 {
   rc_client_achievement_info_t* achievement = subset->achievements;
   rc_client_achievement_info_t* stop = achievement + subset->public_.num_achievements;
 
-  for (; achievement < stop; ++achievement) {
+  for (; achievement < stop; ++achievement, ++slot) {
     rc_trigger_t* trigger = achievement->trigger;
     int old_state, new_state;
     uint32_t old_measured_value;
@@ -6224,7 +6227,8 @@ static void rc_client_do_frame_process_achievements(rc_client_t* client, rc_clie
     old_measured_value = trigger->measured_value;
     old_state = trigger->state;
     if (client->state.change_driven)
-      new_state = rc_evaluate_trigger_change_driven(trigger, rc_client_read_modified_memory_helper, client, client->state.memref_updates);
+      new_state = rc_evaluate_trigger_change_driven(trigger, rc_client_read_modified_memory_helper, client, client->state.memref_updates,
+          client->game->cd_deps ? client->game->cd_changed[slot] : client->state.memref_updates);
     else
       new_state = rc_evaluate_trigger(trigger, rc_client_read_modified_memory_helper, client, NULL);
 
@@ -6620,6 +6624,7 @@ void rc_client_do_frame(rc_client_t* client)
   if (client->game && !client->game->waiting_for_reset) {
     rc_runtime_richpresence_t* richpresence;
     rc_client_subset_info_t* subset;
+    uint32_t slot;
 
     rc_mutex_lock(&client->state.mutex);
 
@@ -6634,9 +6639,11 @@ void rc_client_do_frame(rc_client_t* client)
     rc_client_update_memref_values(client);
 
     client->game->progress_tracker.progress = 0.0;
+    slot = 0;
     for (subset = client->game->subsets; subset; subset = subset->next) {
       if (subset->active)
-        rc_client_do_frame_process_achievements(client, subset);
+        rc_client_do_frame_process_achievements(client, subset, slot);
+      slot += subset->public_.num_achievements;
     }
     if (client->game->pending_events & RC_CLIENT_GAME_PENDING_EVENT_PROGRESS_TRACKER)
       rc_client_do_frame_update_progress_tracker(client, client->game);

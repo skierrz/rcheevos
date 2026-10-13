@@ -273,11 +273,14 @@ typedef struct rc_client_game_info_t {
   uint8_t pending_events;
 
   /* change-driven evaluation: for memref i (memrefs, then modified memrefs, in
-   * list order), cd_deps[cd_offsets[i] .. cd_offsets[i + 1]) are the achievement
-   * triggers that read it. Built for cd_memrefs memrefs and cd_achievements
-   * achievements; rebuilt when either count changes. */
-  rc_trigger_t** cd_deps;
+   * list order), cd_deps[cd_offsets[i] .. cd_offsets[i + 1]) are the slots
+   * (achievements numbered across the subsets, in order) that read it, and
+   * cd_changed[slot] is the last memref update that changed one of them. Built
+   * for cd_memrefs memrefs and cd_achievements achievements; rebuilt when
+   * either count changes. */
+  uint16_t* cd_deps;
   uint32_t* cd_offsets;
+  uint32_t* cd_changed;
   uint32_t cd_memrefs;
   uint32_t cd_achievements;
 
