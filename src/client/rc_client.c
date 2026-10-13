@@ -6017,10 +6017,14 @@ int rc_client_is_processing_required(rc_client_t* client)
 #define RC_CLIENT_CD_CLEAN 2   /* its last evaluation changed nothing and returned its state */
 #define RC_CLIENT_CD_COMPARISON 0x80000000
 #define RC_CLIENT_CD_MAX_SCAN 64 /* comparisons of a memref looked at to find a duplicate */
+#define RC_CLIENT_CD_MAX_SKIPPED 0x10000 /* frames skipped in a row: tallies can't wrap */
 
 typedef struct rc_client_cd_slot_t {
   uint32_t changed;            /* the last frame that something it reads changed */
   uint32_t evaluated;          /* the frame of its last clean evaluation */
+  uint32_t skipped;            /* frames skipped since: hits owed to the tallies */
+  uint32_t tallies;            /* its first bit in tallies */
+  rc_trigger_t* trigger;
   uint8_t flags;
   uint8_t state;               /* trigger->state after its last evaluation */
 } rc_client_cd_slot_t;
@@ -6040,15 +6044,20 @@ typedef struct rc_client_cd_t {
   uint32_t num_changed;
   uint32_t num_changed_before;
   rc_client_cd_slot_t* slots;
+  uint32_t* tallies;           /* per condition of each slot: its last evaluation added a hit to it (a tally) */
   uint32_t* snapshot_hits;     /* the state of the trigger being evaluated, before evaluating it */
   uint8_t* snapshot_flags;
   uint32_t snapshot_size;
 } rc_client_cd_t;
 
+static void rc_client_cd_settle_all(rc_client_game_info_t* game);
+
+/* settles the owed tallies and drops the index (the triggers are about to be changed from outside) */
 static void rc_client_cd_release(rc_client_game_info_t* game)
 {
   rc_client_cd_t* cd = game->cd;
   if (cd) {
+    rc_client_cd_settle_all(game);
     free(cd->memref_offsets);
     free(cd->memref_entries);
     free(cd->comparison_condition);
@@ -6057,6 +6066,7 @@ static void rc_client_cd_release(rc_client_game_info_t* game)
     free(cd->comparison_slots);
     free(cd->changed);
     free(cd->slots);
+    free(cd->tallies);
     free(cd->snapshot_hits);
     free(cd->snapshot_flags);
     free(cd);
@@ -6182,6 +6192,7 @@ typedef struct rc_client_cd_build_t {
   uint32_t* comparison_last;   /* per comparison: 1 + the last slot that counted it */
   uint32_t* comparison_fill;   /* per comparison: its count (pass 1), then its next free entry (pass 2) */
   uint32_t capacity;
+  uint32_t conditions;         /* the evaluated conditions of the last trigger added */
 } rc_client_cd_build_t;
 
 static void rc_client_cd_add_memref(rc_client_cd_build_t* build, uint32_t i, uint32_t entry, int pass)
@@ -6251,9 +6262,11 @@ static int rc_client_cd_add_trigger(rc_client_cd_build_t* build, rc_trigger_t* t
   uint32_t i[2], c, count, size = 2;
   int operand;
 
+  build->conditions = 0;
   RC_CLIENT_CD_FOR_EACH_CONDSET(trigger, condset) {
     condition = rc_client_cd_conditions(condset, &count);
     size += count + 1;
+    build->conditions += count;
     for (; count; --count, ++condition) {
       if (!rc_client_cd_is_evaluated(condition))
         continue;
@@ -6301,7 +6314,7 @@ static rc_client_cd_t* rc_client_cd_build(rc_client_game_info_t* game)
   rc_client_cd_build_t build;
   rc_client_cd_t* cd;
   rc_client_subset_info_t* subset;
-  uint32_t i, n, total, slot;
+  uint32_t i, n, total, slot, bits = 0;
   int pass = 0, ok = 1;
 
   cd = (rc_client_cd_t*)calloc(1, sizeof(rc_client_cd_t));
@@ -6331,11 +6344,17 @@ static rc_client_cd_t* rc_client_cd_build(rc_client_game_info_t* game)
         rc_client_achievement_info_t* achievement = subset->achievements;
         rc_client_achievement_info_t* stop = achievement + subset->public_.num_achievements;
         for (; achievement < stop && ok; ++achievement, ++slot) {
+          cd->slots[slot].trigger = achievement->trigger;
           if (pass == 1 && (!achievement->trigger || achievement->trigger->has_memrefs ||
                             !rc_client_cd_add_trigger(&build, achievement->trigger, slot, 0)))
             cd->slots[slot].flags = RC_CLIENT_CD_NEVER;
-          if (!(cd->slots[slot].flags & RC_CLIENT_CD_NEVER))
+          if (!(cd->slots[slot].flags & RC_CLIENT_CD_NEVER)) {
             ok = rc_client_cd_add_trigger(&build, achievement->trigger, slot, pass);
+            if (pass == 1) {
+              cd->slots[slot].tallies = bits;
+              bits += build.conditions;
+            }
+          }
         }
       }
 
@@ -6360,7 +6379,8 @@ static rc_client_cd_t* rc_client_cd_build(rc_client_game_info_t* game)
         cd->comparison_slots = (uint16_t*)malloc((total + 1) * sizeof(uint16_t));
         cd->snapshot_hits = (uint32_t*)malloc((cd->snapshot_size + 2) * sizeof(uint32_t));
         cd->snapshot_flags = (uint8_t*)malloc(cd->snapshot_size + 2);
-        ok = cd->memref_entries && cd->comparison_offsets && cd->comparison_result && cd->comparison_slots &&
+        cd->tallies = (uint32_t*)calloc(bits / 32 + 1, sizeof(uint32_t));
+        ok = cd->tallies && cd->memref_entries && cd->comparison_offsets && cd->comparison_result && cd->comparison_slots &&
              cd->snapshot_hits && cd->snapshot_flags;
         if (ok) {
           cd->comparison_offsets[cd->num_comparisons] = total;
@@ -6482,14 +6502,16 @@ static void rc_client_cd_end_memref_update(rc_client_cd_t* cd)
   }
 }
 
-/* compare 0: takes a snapshot of the trigger's state (0 if it can't); compare 1: returns 1 if it is unchanged */
-static int rc_client_cd_snapshot(rc_client_cd_t* cd, rc_trigger_t* trigger, int compare)
+/* compare 0: takes a snapshot of the trigger's state. compare 1: returns 1 if the evaluation since
+ * changed nothing but tallies: a condition without a hit target (that isn't AddHits/SubHits) that got
+ * one more hit, which is never read. Records them as the slot's tallies. */
+static int rc_client_cd_snapshot(rc_client_cd_t* cd, rc_client_cd_slot_t* slot, rc_trigger_t* trigger, int compare)
 {
   rc_condset_t* condset;
   rc_condition_t* condition;
   uint32_t* hits = cd->snapshot_hits;
   uint8_t* flags = cd->snapshot_flags;
-  uint32_t count;
+  uint32_t count, bit = slot->tallies;
 
   if (compare) {
     if (hits[0] != trigger->measured_value || flags[0] != trigger->state || flags[1] != trigger->has_hits)
@@ -6512,18 +6534,60 @@ static int rc_client_cd_snapshot(rc_client_cd_t* cd, rc_trigger_t* trigger, int 
       *flags++ = condset->is_paused;
     }
     condition = rc_client_cd_conditions(condset, &count);
-    for (; count; --count, ++condition, ++hits, ++flags) {
-      if (compare) {
-        if (*hits != condition->current_hits || *flags != condition->is_true)
-          return 0;
-      }
-      else {
+    for (; count; --count, ++condition, ++hits, ++flags, ++bit) {
+      if (!compare) {
         *hits = condition->current_hits;
         *flags = condition->is_true;
+      }
+      else if (*flags != condition->is_true) {
+        return 0;
+      }
+      else if (*hits == condition->current_hits) {
+        cd->tallies[bit >> 5] &= ~(1u << (bit & 31));
+      }
+      else if (condition->current_hits == *hits + 1 && *hits < 0xFFFFFFFF - RC_CLIENT_CD_MAX_SKIPPED &&
+               condition->required_hits == 0 &&
+               condition->type != RC_CONDITION_ADD_HITS && condition->type != RC_CONDITION_SUB_HITS) {
+        cd->tallies[bit >> 5] |= 1u << (bit & 31);
+      }
+      else {
+        return 0;
       }
     }
   }
   return 1;
+}
+
+/* adds the hits owed to a skipped trigger's tallies: the hits each skipped evaluation would have
+ * added. Whatever changes hit counts from outside (resets, deserializing, hardcore toggles)
+ * drops the index first, which settles them; an unlock or disabling only changes the state. */
+static void rc_client_cd_settle(rc_client_cd_t* cd, rc_client_cd_slot_t* slot, rc_trigger_t* trigger)
+{
+  rc_condset_t* condset;
+  rc_condition_t* condition;
+  uint32_t count, bit = slot->tallies;
+
+  if (slot->skipped) {
+    RC_CLIENT_CD_FOR_EACH_CONDSET(trigger, condset) {
+      condition = rc_client_cd_conditions(condset, &count);
+      for (; count; --count, ++condition, ++bit) {
+        if (cd->tallies[bit >> 5] & (1u << (bit & 31)))
+          condition->current_hits += slot->skipped;
+      }
+    }
+  }
+  slot->skipped = 0;
+}
+
+static void rc_client_cd_settle_all(rc_client_game_info_t* game)
+{
+  rc_client_cd_t* cd = game->cd;
+  uint32_t i;
+
+  for (i = 0; cd && cd->slots && i < cd->num_slots; ++i) {
+    if (cd->slots[i].skipped)
+      rc_client_cd_settle(cd, &cd->slots[i], cd->slots[i].trigger);
+  }
 }
 
 /* rc_evaluate_trigger, or its result without evaluating it if that can't change anything */
@@ -6535,19 +6599,24 @@ static int rc_client_cd_evaluate_trigger(rc_client_t* client, rc_client_cd_slot_
   if ((slot->flags & RC_CLIENT_CD_NEVER) || !rc_trigger_state_active(trigger->state)) {
     /* not indexed, or a state rc_evaluate_trigger doesn't evaluate in */
     slot->flags &= ~RC_CLIENT_CD_CLEAN;
+    rc_client_cd_settle(cd, slot, trigger);
     return rc_evaluate_trigger(trigger, rc_client_read_modified_memory_helper, client, NULL);
   }
 
   if ((slot->flags & RC_CLIENT_CD_CLEAN) && trigger->state == slot->state &&
-      (int32_t)(slot->changed - slot->evaluated) <= 0)
+      (int32_t)(slot->changed - slot->evaluated) <= 0 && slot->skipped < RC_CLIENT_CD_MAX_SKIPPED) {
+    ++slot->skipped;
     return trigger->state;
+  }
 
-  candidate = (slot->changed != cd->frame) && rc_client_cd_snapshot(cd, trigger, 0);
+  rc_client_cd_settle(cd, slot, trigger);
+
+  candidate = (slot->changed != cd->frame) && rc_client_cd_snapshot(cd, slot, trigger, 0);
 
   ret = rc_evaluate_trigger(trigger, rc_client_read_modified_memory_helper, client, NULL);
 
   slot->flags &= ~RC_CLIENT_CD_CLEAN;
-  if (candidate && ret == trigger->state && rc_client_cd_snapshot(cd, trigger, 1)) {
+  if (candidate && ret == trigger->state && rc_client_cd_snapshot(cd, slot, trigger, 1)) {
     slot->flags |= RC_CLIENT_CD_CLEAN;
     slot->evaluated = cd->frame;
   }
@@ -7361,6 +7430,7 @@ int rc_client_serialize_progress_sized(rc_client_t* client, uint8_t* buffer, siz
     return RC_INVALID_STATE;
 
   rc_mutex_lock(&client->state.mutex);
+  rc_client_cd_settle_all(client->game); /* change-driven evaluation: hits owed to skipped achievements */
   result = rc_runtime_serialize_progress_sized(buffer, (uint32_t)buffer_size, &client->game->runtime, NULL);
   rc_mutex_unlock(&client->state.mutex);
 
