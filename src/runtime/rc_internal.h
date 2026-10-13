@@ -304,6 +304,9 @@ int rc_trigger_state_active(int state);
 /* rc_evaluate_trigger, skipped when it can't change anything (rc_trigger.c);
  * frame counts the caller's memref updates. */
 int rc_evaluate_trigger_change_driven(rc_trigger_t* self, rc_read_memory_func_t read_memory, void* ud, uint32_t frame);
+/* Calls callback with every memref the trigger's conditions read (repeats included). */
+typedef void (*rc_trigger_dependency_func_t)(rc_memref_t* memref, void* userdata);
+void rc_trigger_enum_dependencies(const rc_trigger_t* self, rc_trigger_dependency_func_t callback, void* userdata);
 rc_memrefs_t* rc_trigger_get_memrefs(rc_trigger_t* self);
 
 typedef struct rc_condset_with_trailing_conditions_t {

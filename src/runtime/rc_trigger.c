@@ -49,7 +49,9 @@ void rc_parse_trigger_internal(rc_trigger_t* self, const char** memaddr, rc_pars
   self->has_memrefs = 0;
   self->cd_flags = 0;
   self->cd_state = 0;
+  self->cd_indexed = 0;
   self->cd_frame = 0;
+  self->cd_changed = 0;
 }
 
 int rc_trigger_size(const char* memaddr) {
@@ -361,50 +363,49 @@ void rc_reset_trigger(rc_trigger_t* self) {
  * same bytes. A skipped frame keeps the trigger clean, so it stays skipped
  * until a memref it reads changes.
  *
- * frame: the caller's count of memref updates. A trigger not evaluated on
- * the update before (cd_frame != frame - 1) can't be skipped: its memrefs
- * may have changed in between unseen. Any other change to a trigger's state
- * goes through rc_reset_trigger or the progress reader (they clear
- * cd_flags) or changes trigger->state (checked against cd_state). */
+ * The caller (rc_client) keeps the dependencies: its memref pass stores the
+ * update's number in cd_changed of every indexed trigger that reads a memref
+ * that changed. frame: that number for this update. A trigger not evaluated
+ * on the update before (cd_frame != frame - 1) isn't skipped. Any other
+ * change to a trigger's state goes through rc_reset_trigger or the progress
+ * reader (they clear cd_flags) or changes trigger->state (checked against
+ * cd_state). */
 #define RC_CD_CLEAN 1       /* the last evaluation changed no state and returned trigger->state */
-#define RC_CD_DEP_PREV 2    /* a memref it reads changed at the last evaluation */
 #define RC_CD_MAX_CONDITIONS 128
 
-static int rc_operand_changed(const rc_operand_t* operand) {
+/* The memref an operand's value comes from, or NULL (a constant). */
+static rc_memref_t* rc_operand_dependency(const rc_operand_t* operand) {
   switch (operand->type) {
     case RC_OPERAND_CONST:
     case RC_OPERAND_FP:
     case RC_OPERAND_FUNC:
-      return 0;
+      return NULL;
 
     case RC_OPERAND_RECALL:
-      if (!rc_operand_type_is_memref(operand->memref_access_type) || !operand->value.memref)
-        return 0;
-      return operand->value.memref->value.changed;
+      if (!rc_operand_type_is_memref(operand->memref_access_type))
+        return NULL;
+      return operand->value.memref;
 
     default:
-      return operand->value.memref->value.changed;
+      return operand->value.memref;
   }
 }
 
-static int rc_condset_memrefs_changed(const rc_condset_t* condset) {
+void rc_trigger_enum_dependencies(const rc_trigger_t* self, rc_trigger_dependency_func_t callback, void* userdata) {
+  const rc_condset_t* condset = self->requirement;
   const rc_condition_t* condition;
-  for (condition = condset->conditions; condition; condition = condition->next) {
-    if (rc_operand_changed(&condition->operand1) || rc_operand_changed(&condition->operand2))
-      return 1;
-  }
-  return 0;
-}
+  rc_memref_t* memref;
 
-static int rc_trigger_memrefs_changed(const rc_trigger_t* self) {
-  const rc_condset_t* condset;
-  if (self->requirement && rc_condset_memrefs_changed(self->requirement))
-    return 1;
-  for (condset = self->alternative; condset; condset = condset->next) {
-    if (rc_condset_memrefs_changed(condset))
-      return 1;
+  if (!condset)
+    condset = self->alternative;
+  for (; condset; condset = (condset == self->requirement) ? self->alternative : condset->next) {
+    for (condition = condset->conditions; condition; condition = condition->next) {
+      if ((memref = rc_operand_dependency(&condition->operand1)) != NULL)
+        callback(memref, userdata);
+      if ((memref = rc_operand_dependency(&condition->operand2)) != NULL)
+        callback(memref, userdata);
+    }
   }
-  return 0;
 }
 
 /* the state an evaluation can change, for one comparison before and after */
@@ -463,31 +464,30 @@ static int rc_trigger_snapshot(const rc_trigger_t* self, rc_trigger_snapshot_t* 
 
 int rc_evaluate_trigger_change_driven(rc_trigger_t* self, rc_read_memory_func_t read_memory, void* ud, uint32_t frame) {
   rc_trigger_snapshot_t snapshot;
-  int changed, followed, have_snapshot, ret;
+  int unchanged, have_snapshot, ret;
 
-  if (self->has_memrefs || !rc_trigger_state_active(self->state)) {
-    /* not a candidate: its own memrefs, or a state rc_evaluate_trigger handles without evaluating */
+  if (self->has_memrefs || !self->cd_indexed || !rc_trigger_state_active(self->state)) {
+    /* not a candidate: its own memrefs, no dependency index, or a state rc_evaluate_trigger handles without evaluating */
     self->cd_flags = 0;
     return rc_evaluate_trigger(self, read_memory, ud, NULL);
   }
 
-  changed = rc_trigger_memrefs_changed(self);
-  followed = (self->cd_frame == frame - 1);   /* evaluated on the update before this one */
+  unchanged = (self->cd_changed != frame);
 
-  if (!changed && followed && (self->cd_flags & (RC_CD_CLEAN | RC_CD_DEP_PREV)) == RC_CD_CLEAN &&
-      self->state == self->cd_state) {
+  if (unchanged && self->cd_changed != frame - 1 && self->cd_frame == frame - 1 &&
+      (self->cd_flags & RC_CD_CLEAN) && self->state == self->cd_state) {
     self->cd_frame = frame;
     return self->state;
   }
 
   /* the evaluation can only make the trigger skippable next frame if its memrefs are unchanged now */
-  have_snapshot = !changed && rc_trigger_snapshot(self, &snapshot, 0);
+  have_snapshot = unchanged && rc_trigger_snapshot(self, &snapshot, 0);
 
   ret = rc_evaluate_trigger(self, read_memory, ud, NULL);
 
-  self->cd_flags = changed ? RC_CD_DEP_PREV : 0;
+  self->cd_flags = 0;
   if (have_snapshot && ret == self->state && ret == snapshot.state && rc_trigger_snapshot(self, &snapshot, 1))
-    self->cd_flags |= RC_CD_CLEAN;
+    self->cd_flags = RC_CD_CLEAN;
   self->cd_state = self->state;
   self->cd_frame = frame;
   return ret;
