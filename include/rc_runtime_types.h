@@ -293,7 +293,9 @@ struct rc_trigger_t {
   /* Change-driven evaluation (rc_client_set_change_driven_enabled): internal */
   uint8_t cd_flags;
   uint8_t cd_state;
-  uint32_t cd_frame;
+  uint8_t cd_indexed;     /* rc_client marks cd_changed when a memref it reads changes */
+  uint32_t cd_frame;      /* the memref update it was last evaluated (or skipped) on */
+  uint32_t cd_changed;    /* the last memref update that changed a memref it reads */
 };
 
 RC_EXPORT int RC_CCONV rc_trigger_size(const char* memaddr);

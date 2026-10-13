@@ -1183,6 +1183,9 @@ void rc_client_destroy_all_user_progress(rc_client_all_user_progress_t* list)
 
 static void rc_client_free_game(rc_client_game_info_t* game)
 {
+  free(game->cd_deps);
+  free(game->cd_offsets);
+
   rc_runtime_destroy(&game->runtime);
 
   rc_buffer_destroy(&game->buffer);
@@ -5989,11 +5992,169 @@ int rc_client_is_processing_required(rc_client_t* client)
   return (client->game->runtime.richpresence && client->game->runtime.richpresence->richpresence);
 }
 
+/* ===== change-driven evaluation: which achievements read which memref ===== */
+
+static uint32_t rc_client_cd_count_memrefs(const rc_memrefs_t* memrefs) {
+  const rc_memref_list_t* memref_list = &memrefs->memrefs;
+  const rc_modified_memref_list_t* modified_memref_list = &memrefs->modified_memrefs;
+  uint32_t count = 0;
+  for (; memref_list; memref_list = memref_list->next)
+    count += memref_list->count;
+  for (; modified_memref_list; modified_memref_list = modified_memref_list->next)
+    count += modified_memref_list->count;
+  return count;
+}
+
+static uint32_t rc_client_cd_count_achievements(const rc_client_game_info_t* game) {
+  const rc_client_subset_info_t* subset;
+  uint32_t count = 0;
+  for (subset = game->subsets; subset; subset = subset->next)
+    count += subset->public_.num_achievements;
+  return count;
+}
+
+/* the memref's index in pass order, or UINT32_MAX if it isn't the game's */
+static uint32_t rc_client_cd_memref_index(const rc_memrefs_t* memrefs, const rc_memref_t* memref) {
+  const rc_memref_list_t* memref_list = &memrefs->memrefs;
+  const rc_modified_memref_list_t* modified_memref_list = &memrefs->modified_memrefs;
+  uint32_t base = 0;
+  for (; memref_list; memref_list = memref_list->next) {
+    if (memref >= memref_list->items && memref < memref_list->items + memref_list->count)
+      return base + (uint32_t)(memref - memref_list->items);
+    base += memref_list->count;
+  }
+  for (; modified_memref_list; modified_memref_list = modified_memref_list->next) {
+    const rc_modified_memref_t* modified_memref = (const rc_modified_memref_t*)memref;
+    if (modified_memref >= modified_memref_list->items && modified_memref < modified_memref_list->items + modified_memref_list->count)
+      return base + (uint32_t)(modified_memref - modified_memref_list->items);
+    base += modified_memref_list->count;
+  }
+  return UINT32_MAX;
+}
+
+typedef struct rc_client_cd_build_t {
+  rc_client_game_info_t* game;
+  rc_trigger_t* trigger;
+  uint32_t* last;     /* per memref: 1 + the index of the last trigger that counted it (dedupe) */
+  uint32_t* fill;     /* per memref: next free entry (second pass), or the count (first pass) */
+  uint32_t trigger_index;
+  int failed;
+  int second_pass;
+} rc_client_cd_build_t;
+
+static void rc_client_cd_add_dependency(rc_memref_t* memref, void* userdata) {
+  rc_client_cd_build_t* build = (rc_client_cd_build_t*)userdata;
+  const uint32_t i = rc_client_cd_memref_index(build->game->runtime.memrefs, memref);
+  if (i == UINT32_MAX) {
+    build->failed = 1;   /* a memref outside the game's lists: this trigger can't be indexed */
+    return;
+  }
+  if (build->last[i] == build->trigger_index + 1)
+    return;
+  build->last[i] = build->trigger_index + 1;
+  if (build->second_pass)
+    build->game->cd_deps[build->fill[i]++] = build->trigger;
+  else
+    build->fill[i]++;
+}
+
+/* builds the index for the game's current memrefs and achievements; on failure
+ * (memory, or a memref outside the game's lists) no trigger is indexed */
+static void rc_client_cd_build_index(rc_client_t* client, rc_client_game_info_t* game) {
+  rc_client_cd_build_t build;
+  rc_client_subset_info_t* subset;
+  uint32_t count, i, total;
+  int pass;
+
+  free(game->cd_deps);
+  free(game->cd_offsets);
+  game->cd_deps = NULL;
+  game->cd_offsets = NULL;
+  game->cd_memrefs = count = rc_client_cd_count_memrefs(game->runtime.memrefs);
+  game->cd_achievements = rc_client_cd_count_achievements(game);
+
+  memset(&build, 0, sizeof(build));
+  build.game = game;
+  build.last = (uint32_t*)calloc(count + 1, sizeof(uint32_t));
+  build.fill = (uint32_t*)calloc(count + 1, sizeof(uint32_t));
+  game->cd_offsets = (uint32_t*)calloc(count + 1, sizeof(uint32_t));
+
+  for (pass = 0; pass < 2 && build.last && build.fill && game->cd_offsets; ++pass) {
+    build.second_pass = pass;
+    build.trigger_index = 0;
+    if (pass) {
+      for (i = 0; i <= count; ++i)
+        build.last[i] = 0;
+    }
+    for (subset = game->subsets; subset; subset = subset->next) {
+      rc_client_achievement_info_t* achievement = subset->achievements;
+      rc_client_achievement_info_t* stop = achievement + subset->public_.num_achievements;
+      for (; achievement < stop; ++achievement, ++build.trigger_index) {
+        if (!achievement->trigger || achievement->trigger->has_memrefs)
+          continue;
+        build.trigger = achievement->trigger;
+        rc_trigger_enum_dependencies(achievement->trigger, rc_client_cd_add_dependency, &build);
+      }
+    }
+    if (build.failed)
+      break;
+    if (!pass) {
+      /* counts -> offsets (exclusive prefix sums), then the entries */
+      total = 0;
+      for (i = 0; i < count; ++i) {
+        const uint32_t n = build.fill[i];
+        game->cd_offsets[i] = build.fill[i] = total;
+        total += n;
+      }
+      game->cd_offsets[count] = total;
+      game->cd_deps = (rc_trigger_t**)malloc((total ? total : 1) * sizeof(rc_trigger_t*));
+      if (!game->cd_deps)
+        break;
+    }
+  }
+
+  free(build.last);
+  free(build.fill);
+
+  if (pass < 2) {
+    /* no index: every achievement is evaluated. cd_offsets stays (if it was
+     * allocated) so this isn't retried until the counts change */
+    free(game->cd_deps);
+    game->cd_deps = NULL;
+    RC_CLIENT_LOG_WARN(client, "Change-driven evaluation: dependency index not built; evaluating every achievement");
+  }
+
+  /* every trigger starts unskippable: changed now, not clean */
+  for (subset = game->subsets; subset; subset = subset->next) {
+    rc_client_achievement_info_t* achievement = subset->achievements;
+    rc_client_achievement_info_t* stop = achievement + subset->public_.num_achievements;
+    for (; achievement < stop; ++achievement) {
+      rc_trigger_t* trigger = achievement->trigger;
+      if (!trigger)
+        continue;
+      trigger->cd_indexed = (game->cd_deps && !trigger->has_memrefs) ? 1 : 0;
+      trigger->cd_changed = client->state.memref_updates;
+      trigger->cd_flags = 0;
+    }
+  }
+}
+
+static void rc_client_cd_mark(rc_client_game_info_t* game, uint32_t i, uint32_t frame) {
+  rc_trigger_t** dep = game->cd_deps + game->cd_offsets[i];
+  rc_trigger_t** stop = game->cd_deps + game->cd_offsets[i + 1];
+  for (; dep < stop; ++dep)
+    (*dep)->cd_changed = frame;
+}
+
 static void rc_client_update_memref_values(rc_client_t* client) {
   rc_memrefs_t* memrefs = client->game->runtime.memrefs;
   rc_memref_list_t* memref_list;
   rc_modified_memref_list_t* modified_memref_list;
   int invalidated_memref = 0;
+  /* change-driven evaluation: mark the achievements that read a memref that changed */
+  rc_client_game_info_t* cd_game = (client->state.change_driven && client->game->cd_deps) ? client->game : NULL;
+  const uint32_t cd_frame = client->state.memref_updates;
+  uint32_t cd_index = 0;
 
   memref_list = &memrefs->memrefs;
   do {
@@ -6001,7 +6162,7 @@ static void rc_client_update_memref_values(rc_client_t* client) {
     const rc_memref_t* memref_stop = memref + memref_list->count;
     uint32_t value;
 
-    for (; memref < memref_stop; ++memref) {
+    for (; memref < memref_stop; ++memref, ++cd_index) {
       if (memref->value.type == RC_VALUE_TYPE_NONE)
         continue;
 
@@ -6012,6 +6173,8 @@ static void rc_client_update_memref_values(rc_client_t* client) {
 
       if (client->state.processing_memref) {
         rc_update_memref_value(&memref->value, value);
+        if (cd_game && memref->value.changed)
+          rc_client_cd_mark(cd_game, cd_index, cd_frame);
       }
       else {
         /* if the peek function cleared the processing_memref, the memref was invalidated */
@@ -6030,9 +6193,11 @@ static void rc_client_update_memref_values(rc_client_t* client) {
       rc_modified_memref_t* modified_memref = modified_memref_list->items;
       const rc_modified_memref_t* modified_memref_stop = modified_memref + modified_memref_list->count;
 
-      for (; modified_memref < modified_memref_stop; ++modified_memref) {
+      for (; modified_memref < modified_memref_stop; ++modified_memref, ++cd_index) {
         rc_update_memref_value(&modified_memref->memref.value,
             rc_get_modified_memref_value(modified_memref, rc_client_read_modified_memory_helper, client));
+        if (cd_game && modified_memref->memref.value.changed)
+          rc_client_cd_mark(cd_game, cd_index, cd_frame);
       }
 
       modified_memref_list = modified_memref_list->next;
@@ -6460,8 +6625,13 @@ void rc_client_do_frame(rc_client_t* client)
 
     rc_client_reset_pending_events(client);
 
-    rc_client_update_memref_values(client);
     ++client->state.memref_updates;
+    if (client->state.change_driven &&
+        (!client->game->cd_offsets ||
+         client->game->cd_memrefs != rc_client_cd_count_memrefs(client->game->runtime.memrefs) ||
+         client->game->cd_achievements != rc_client_cd_count_achievements(client->game)))
+      rc_client_cd_build_index(client, client->game);
+    rc_client_update_memref_values(client);
 
     client->game->progress_tracker.progress = 0.0;
     for (subset = client->game->subsets; subset; subset = subset->next) {
