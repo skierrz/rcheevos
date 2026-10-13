@@ -10706,6 +10706,192 @@ static void test_version(void)
 
 /* ----- harness ----- */
 
+/* ----- trigger evaluator ----- */
+
+typedef struct trigger_evaluator_state_t {
+  uint32_t claim_mod;          /* claim achievements whose id % claim_mod == 0 (1: all) */
+  uint32_t claimed;
+  uint32_t frames;
+  uint32_t work_count;
+  uint32_t results;
+  uint32_t frame_ends;
+  uint32_t ids[32];
+  int states[32];
+  uint8_t storage[4096];
+  size_t storage_used;
+} trigger_evaluator_state_t;
+
+static trigger_evaluator_state_t g_evaluator;
+
+static int RC_CCONV evaluator_claim(uint32_t achievement_id, void* userdata)
+{
+  trigger_evaluator_state_t* state = (trigger_evaluator_state_t*)userdata;
+  if (achievement_id % state->claim_mod != 0)
+    return 0;
+  state->claimed++;
+  return 1;
+}
+
+static void* RC_CCONV evaluator_alloc(uint32_t achievement_id, size_t size, void* userdata)
+{
+  trigger_evaluator_state_t* state = (trigger_evaluator_state_t*)userdata;
+  void* ptr;
+  (void)achievement_id;
+  size = (size + 7) & ~7;
+  if (state->storage_used + size > sizeof(state->storage))
+    return NULL;
+  ptr = &state->storage[state->storage_used];
+  state->storage_used += size;
+  return ptr;
+}
+
+static void RC_CCONV evaluator_frame_begin(const rc_client_claimed_trigger_t* work, uint32_t count, void* userdata)
+{
+  trigger_evaluator_state_t* state = (trigger_evaluator_state_t*)userdata;
+  uint32_t i;
+  state->frames++;
+  state->work_count = count;
+  /* evaluate in reverse order: the order must not matter */
+  for (i = count; i > 0; --i) {
+    state->ids[i - 1] = work[i - 1].achievement_id;
+    state->states[i - 1] = rc_client_evaluate_claimed_trigger(work[i - 1].trigger);
+  }
+}
+
+static int RC_CCONV evaluator_result(uint32_t achievement_id, void* trigger, void* userdata)
+{
+  trigger_evaluator_state_t* state = (trigger_evaluator_state_t*)userdata;
+  uint32_t i;
+  (void)trigger;
+  state->results++;
+  for (i = 0; i < state->work_count; ++i) {
+    if (state->ids[i] == achievement_id)
+      return state->states[i];
+  }
+  state->results = 0xFFFFFFFF; /* not in the work list: fails the results == work_count checks */
+  return RC_TRIGGER_STATE_INACTIVE;
+}
+
+static void RC_CCONV evaluator_frame_end(void* userdata)
+{
+  trigger_evaluator_state_t* state = (trigger_evaluator_state_t*)userdata;
+  state->frame_ends++;
+}
+
+static rc_client_t* mock_client_game_loaded_with_evaluator(const char* patchdata, const char* unlocks, uint32_t claim_mod, int use_alloc)
+{
+  rc_client_trigger_evaluator_t evaluator;
+  memset(&g_evaluator, 0, sizeof(g_evaluator));
+  g_evaluator.claim_mod = claim_mod;
+  memset(&evaluator, 0, sizeof(evaluator));
+  evaluator.claim = evaluator_claim;
+  evaluator.alloc = use_alloc ? evaluator_alloc : NULL;
+  evaluator.frame_begin = evaluator_frame_begin;
+  evaluator.result = evaluator_result;
+  evaluator.frame_end = evaluator_frame_end;
+  evaluator.userdata = &g_evaluator;
+
+  g_client = mock_client_logged_in();
+  rc_client_set_trigger_evaluator(g_client, &evaluator);
+  mock_client_load_game(patchdata, unlocks);
+  return g_client;
+}
+
+static void test_trigger_evaluator_trigger(int claim_mod, int use_alloc)
+{
+  rc_client_event_t* event;
+  uint8_t memory[64];
+  memset(memory, 0, sizeof(memory));
+
+  g_client = mock_client_game_loaded_with_evaluator(patchdata_exhaustive, no_unlocks, claim_mod, use_alloc);
+
+  ASSERT_PTR_NOT_NULL(g_client->game);
+  if (g_client->game) {
+    const uint32_t num_active = g_client->game->runtime.trigger_count;
+    const uint32_t claimed = g_evaluator.claimed;
+    ASSERT_NUM_NOT_EQUALS(claimed, 0);
+    if (use_alloc) {
+      ASSERT_NUM_NOT_EQUALS(g_evaluator.storage_used, 0);
+    }
+    mock_memory(memory, sizeof(memory));
+
+    mock_api_response("r=awardachievement&u=Username&t=ApiToken&a=8&h=1&m=0123456789ABCDEF&v=da80b659c2b858e13ddd97077647b217",
+        "{\"Success\":true,\"Score\":5432,\"SoftcoreScore\":777,\"AchievementID\":8,\"AchievementsRemaining\":11}");
+
+    event_count = 0;
+    rc_client_do_frame(g_client);
+    ASSERT_NUM_EQUALS(event_count, 0);
+    ASSERT_NUM_EQUALS(g_evaluator.frames, 1);
+    ASSERT_NUM_EQUALS(g_evaluator.frame_ends, 1);
+    ASSERT_NUM_EQUALS(g_evaluator.results, g_evaluator.work_count);
+
+    memory[8] = 8;
+    rc_client_do_frame(g_client);
+    ASSERT_NUM_EQUALS(event_count, 1);
+
+    event = find_event(RC_CLIENT_EVENT_ACHIEVEMENT_TRIGGERED, 8);
+    ASSERT_PTR_NOT_NULL(event);
+    ASSERT_NUM_EQUALS(event->achievement->state, RC_CLIENT_ACHIEVEMENT_STATE_UNLOCKED);
+    ASSERT_NUM_EQUALS(event->achievement->unlocked, RC_CLIENT_ACHIEVEMENT_UNLOCKED_BOTH);
+    ASSERT_NUM_EQUALS(event->achievement->bucket, RC_CLIENT_ACHIEVEMENT_BUCKET_RECENTLY_UNLOCKED);
+
+    ASSERT_NUM_EQUALS(g_client->game->runtime.trigger_count, num_active - 1);
+    ASSERT_NUM_EQUALS(g_client->user.score, 5432);
+
+    /* the unlocked achievement is no longer in the work list */
+    {
+      const uint32_t before = g_evaluator.work_count;
+      const uint32_t expected = (8 % claim_mod == 0) ? before - 1 : before;
+      event_count = 0;
+      rc_client_do_frame(g_client);
+      ASSERT_NUM_EQUALS(event_count, 0);
+      ASSERT_NUM_EQUALS(g_evaluator.work_count, expected);
+    }
+  }
+
+  rc_client_destroy(g_client);
+}
+
+static void test_trigger_evaluator_claim_all(void) { test_trigger_evaluator_trigger(1, 0); }
+static void test_trigger_evaluator_claim_all_alloc(void) { test_trigger_evaluator_trigger(1, 1); }
+static void test_trigger_evaluator_claim_even(void) { test_trigger_evaluator_trigger(2, 1); }
+static void test_trigger_evaluator_claim_other(void) { test_trigger_evaluator_trigger(3, 0); }
+
+static void RC_CCONV count_memref_storage(const void* address, size_t size, void* userdata)
+{
+  size_t* total = (size_t*)userdata;
+  (void)address;
+  *total += size;
+}
+
+static void test_enum_memref_storage(void)
+{
+  size_t total = 0;
+  g_client = mock_client_game_loaded(patchdata_exhaustive, no_unlocks);
+  ASSERT_PTR_NOT_NULL(g_client->game);
+  rc_client_enum_memref_storage(g_client, count_memref_storage, &total);
+  ASSERT_NUM_NOT_EQUALS(total, 0);
+  rc_client_destroy(g_client);
+}
+
+static void test_trigger_evaluator_none_claimed(void)
+{
+  uint8_t memory[64];
+  memset(memory, 0, sizeof(memory));
+
+  g_client = mock_client_game_loaded_with_evaluator(patchdata_exhaustive, no_unlocks, 1000000, 0);
+  ASSERT_PTR_NOT_NULL(g_client->game);
+  if (g_client->game) {
+    mock_memory(memory, sizeof(memory));
+    rc_client_do_frame(g_client);
+    ASSERT_NUM_EQUALS(g_evaluator.claimed, 0);
+    ASSERT_NUM_EQUALS(g_evaluator.frames, 1);
+    ASSERT_NUM_EQUALS(g_evaluator.work_count, 0);
+    ASSERT_NUM_EQUALS(g_evaluator.results, 0);
+  }
+  rc_client_destroy(g_client);
+}
+
 void test_client(void) {
   TEST_SUITE_BEGIN();
 
@@ -10894,6 +11080,12 @@ void test_client(void) {
   TEST(test_do_frame_bounds_check_system);
   TEST(test_do_frame_bounds_check_available);
   TEST(test_do_frame_achievement_trigger);
+  TEST(test_trigger_evaluator_claim_all);
+  TEST(test_trigger_evaluator_claim_all_alloc);
+  TEST(test_trigger_evaluator_claim_even);
+  TEST(test_trigger_evaluator_claim_other);
+  TEST(test_trigger_evaluator_none_claimed);
+  TEST(test_enum_memref_storage);
   TEST(test_do_frame_achievement_trigger_already_awarded);
   TEST(test_do_frame_achievement_trigger_server_error);
   TEST(test_do_frame_achievement_trigger_while_spectating);

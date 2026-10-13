@@ -12,6 +12,7 @@
 
 #include "../util/rc_version.h"
 
+#include <assert.h>
 #include <stdarg.h>
 
 #ifdef _WIN32
@@ -2117,8 +2118,16 @@ static void rc_client_copy_achievements(rc_client_load_state_t* load_state,
       achievement->public_.bucket = RC_CLIENT_ACHIEVEMENT_BUCKET_UNSUPPORTED;
     }
     else {
+      const rc_client_trigger_evaluator_t* evaluator = &load_state->client->state.trigger_evaluator;
+      void* trigger_buffer = NULL;
+      if (evaluator->result && evaluator->claim && evaluator->claim(read->id, evaluator->userdata)) {
+        achievement->claimed = 1;
+        if (evaluator->alloc)
+          trigger_buffer = evaluator->alloc(read->id, (size_t)trigger_size, evaluator->userdata);
+      }
+
       /* populate the item, using the communal memrefs pool */
-      rc_reset_parse_state(&preparse.parse, rc_buffer_reserve(buffer, trigger_size));
+      rc_reset_parse_state(&preparse.parse, trigger_buffer ? trigger_buffer : rc_buffer_reserve(buffer, trigger_size));
       rc_preparse_reserve_memrefs(&preparse, load_state->game->runtime.memrefs);
       achievement->trigger = RC_ALLOC(rc_trigger_t, &preparse.parse);
       memaddr = read->definition;
@@ -2129,7 +2138,7 @@ static void rc_client_copy_achievements(rc_client_load_state_t* load_state,
         achievement->public_.state = RC_CLIENT_ACHIEVEMENT_STATE_DISABLED;
         achievement->public_.bucket = RC_CLIENT_ACHIEVEMENT_BUCKET_UNSUPPORTED;
       }
-      else {
+      else if (!trigger_buffer) {
         rc_buffer_consume(buffer, (const uint8_t*)preparse.parse.buffer, (uint8_t*)preparse.parse.buffer + preparse.parse.offset);
       }
     }
@@ -2154,6 +2163,22 @@ static void rc_client_copy_achievements(rc_client_load_state_t* load_state,
   }
 
   subset->achievements = achievements;
+
+  /* room for every claimed achievement in the per-frame work list */
+  if (load_state->client->state.trigger_evaluator.result) {
+    rc_client_game_info_t* game = load_state->game;
+    uint32_t claimed = 0;
+    for (scan = achievements; scan < achievement; ++scan)
+      claimed += scan->claimed;
+
+    if (claimed) {
+      const uint32_t capacity = game->claimed_work_capacity + claimed;
+      game->claimed_work = (rc_client_claimed_trigger_t*)rc_buffer_alloc(&game->buffer, capacity * sizeof(rc_client_claimed_trigger_t));
+      game->claimed_old_measured_value = (uint32_t*)rc_buffer_alloc(&game->buffer, capacity * sizeof(uint32_t));
+      game->claimed_old_state = (uint8_t*)rc_buffer_alloc(&game->buffer, capacity);
+      game->claimed_work_capacity = capacity;
+    }
+  }
 }
 
 uint8_t rc_client_map_leaderboard_format(int format)
@@ -5921,6 +5946,47 @@ void rc_client_set_read_memory_function(rc_client_t* client, rc_client_read_memo
   client->callbacks.read_memory = handler;
 }
 
+void rc_client_set_trigger_evaluator(rc_client_t* client, const rc_client_trigger_evaluator_t* evaluator)
+{
+  if (!client)
+    return;
+
+  if (evaluator)
+    memcpy(&client->state.trigger_evaluator, evaluator, sizeof(*evaluator));
+  else
+    memset(&client->state.trigger_evaluator, 0, sizeof(client->state.trigger_evaluator));
+}
+
+int rc_client_evaluate_claimed_trigger(void* trigger)
+{
+  rc_trigger_t* self = (rc_trigger_t*)trigger;
+
+  /* rc_client's triggers use the game's memrefs, which rc_client_do_frame has already updated,
+   * so evaluating one reads no memory */
+  assert(!self->has_memrefs);
+  return rc_evaluate_trigger(self, NULL, NULL, NULL);
+}
+
+void rc_client_enum_memref_storage(rc_client_t* client, rc_client_memref_storage_callback_t callback, void* userdata)
+{
+  const rc_memref_list_t* memref_list;
+  const rc_modified_memref_list_t* modified_memref_list;
+
+  if (!client || !client->game || !client->game->runtime.memrefs || !callback)
+    return;
+
+  for (memref_list = &client->game->runtime.memrefs->memrefs; memref_list; memref_list = memref_list->next) {
+    if (memref_list->count)
+      callback(memref_list->items, memref_list->count * sizeof(rc_memref_t), userdata);
+  }
+
+  modified_memref_list = &client->game->runtime.memrefs->modified_memrefs;
+  for (; modified_memref_list; modified_memref_list = modified_memref_list->next) {
+    if (modified_memref_list->count)
+      callback(modified_memref_list->items, modified_memref_list->count * sizeof(rc_modified_memref_t), userdata);
+  }
+}
+
 void rc_client_set_allow_background_memory_reads(rc_client_t* client, int allowed)
 {
   if (!client)
@@ -6043,6 +6109,39 @@ static void rc_client_update_memref_values(rc_client_t* client) {
     rc_client_update_active_achievements(client->game);
 }
 
+static void rc_client_begin_claimed_triggers(rc_client_t* client)
+{
+  /* ASSERT: this should only be called if the mutex is held */
+  rc_client_subset_info_t* subset;
+  uint32_t count = 0;
+
+  for (subset = client->game->subsets; subset; subset = subset->next) {
+    rc_client_achievement_info_t* achievement = subset->achievements;
+    rc_client_achievement_info_t* stop = achievement + subset->public_.num_achievements;
+
+    if (!subset->active)
+      continue;
+
+    for (; achievement < stop; ++achievement) {
+      if (!achievement->claimed || !achievement->trigger || achievement->public_.state != RC_CLIENT_ACHIEVEMENT_STATE_ACTIVE)
+        continue;
+
+      /* ASSERT: claimed_work has room for every claimed achievement (rc_client_copy_achievements) */
+      client->game->claimed_work[count].achievement_id = achievement->public_.id;
+      client->game->claimed_work[count].trigger = achievement->trigger;
+      /* the evaluator may run before rc_client gets to this achievement: keep what
+       * rc_client_do_frame_process_achievements compares the result with */
+      client->game->claimed_old_measured_value[count] = achievement->trigger->measured_value;
+      client->game->claimed_old_state[count] = achievement->trigger->state;
+      ++count;
+    }
+  }
+
+  client->game->claimed_work_next = 0;
+  if (client->state.trigger_evaluator.frame_begin)
+    client->state.trigger_evaluator.frame_begin(client->game->claimed_work, count, client->state.trigger_evaluator.userdata);
+}
+
 static void rc_client_do_frame_process_achievements(rc_client_t* client, rc_client_subset_info_t* subset)
 {
   rc_client_achievement_info_t* achievement = subset->achievements;
@@ -6056,9 +6155,18 @@ static void rc_client_do_frame_process_achievements(rc_client_t* client, rc_clie
     if (!trigger || achievement->public_.state != RC_CLIENT_ACHIEVEMENT_STATE_ACTIVE)
       continue;
 
-    old_measured_value = trigger->measured_value;
-    old_state = trigger->state;
-    new_state = rc_evaluate_trigger(trigger, rc_client_read_modified_memory_helper, client, NULL);
+    if (achievement->claimed) {
+      /* ASSERT: this is the next entry of the frame's work list (same achievements, same order) */
+      const uint32_t index = client->game->claimed_work_next++;
+      old_measured_value = client->game->claimed_old_measured_value[index];
+      old_state = client->game->claimed_old_state[index];
+      new_state = client->state.trigger_evaluator.result(achievement->public_.id, trigger, client->state.trigger_evaluator.userdata);
+    }
+    else {
+      old_measured_value = trigger->measured_value;
+      old_state = trigger->state;
+      new_state = rc_evaluate_trigger(trigger, rc_client_read_modified_memory_helper, client, NULL);
+    }
 
     /* trigger->state doesn't actually change to RESET - RESET just serves as a notification.
      * we don't care about that particular notification, so look at the actual state. */
@@ -6459,11 +6567,17 @@ void rc_client_do_frame(rc_client_t* client)
 
     rc_client_update_memref_values(client);
 
+    if (client->state.trigger_evaluator.result)
+      rc_client_begin_claimed_triggers(client);
+
     client->game->progress_tracker.progress = 0.0;
     for (subset = client->game->subsets; subset; subset = subset->next) {
       if (subset->active)
         rc_client_do_frame_process_achievements(client, subset);
     }
+
+    if (client->state.trigger_evaluator.frame_end)
+      client->state.trigger_evaluator.frame_end(client->state.trigger_evaluator.userdata);
     if (client->game->pending_events & RC_CLIENT_GAME_PENDING_EVENT_PROGRESS_TRACKER)
       rc_client_do_frame_update_progress_tracker(client, client->game);
 

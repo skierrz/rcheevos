@@ -903,6 +903,58 @@ RC_EXPORT void RC_CCONV rc_client_set_read_memory_function(rc_client_t* client, 
 RC_EXPORT void RC_CCONV rc_client_set_allow_background_memory_reads(rc_client_t* client, int allowed);
 
 /**
+ * Lets the host evaluate some achievements' triggers elsewhere (another core or thread) during
+ * rc_client_do_frame. rc_client still owns every achievement: it reads memory (all memrefs are
+ * updated by rc_client_do_frame as usual), processes each result at that achievement's place in
+ * its own order, and raises every event and server request itself.
+ *
+ * Install before loading a game. For each achievement it parses, rc_client calls claim(); a
+ * claimed achievement's trigger is parsed into memory from alloc() (if provided and non-NULL; the
+ * host keeps it valid until the game is unloaded). In rc_client_do_frame, after the memrefs are
+ * updated, rc_client calls frame_begin() with the frame's work list: exactly the claimed triggers
+ * it is about to evaluate, in its own order (active achievements only). The host evaluates each
+ * of them once with rc_client_evaluate_claimed_trigger() (anywhere, in any order, concurrently
+ * with rc_client). When an achievement's turn comes, rc_client calls result(), which must return
+ * what rc_client_evaluate_claimed_trigger() returned for that trigger this frame. After the last
+ * achievement, rc_client calls frame_end(); by then every listed trigger has been returned.
+ *
+ * Between frame_begin() and frame_end(), rc_client neither modifies memrefs nor touches claimed
+ * triggers other than through result(), and the host must not call rc_client functions that read
+ * or write achievements (resets, hardcore changes, unloads, progress serialization, achievement
+ * lists): do those outside that window. Pass NULL to remove the evaluator.
+ */
+typedef struct rc_client_claimed_trigger_t {
+  uint32_t achievement_id;
+  void* trigger;
+} rc_client_claimed_trigger_t;
+
+typedef struct rc_client_trigger_evaluator_t {
+  int (RC_CCONV *claim)(uint32_t achievement_id, void* userdata);
+  void* (RC_CCONV *alloc)(uint32_t achievement_id, size_t size, void* userdata);
+  void (RC_CCONV *frame_begin)(const rc_client_claimed_trigger_t* work, uint32_t count, void* userdata);
+  int (RC_CCONV *result)(uint32_t achievement_id, void* trigger, void* userdata);
+  void (RC_CCONV *frame_end)(void* userdata);
+  void* userdata;
+} rc_client_trigger_evaluator_t;
+
+RC_EXPORT void RC_CCONV rc_client_set_trigger_evaluator(rc_client_t* client, const rc_client_trigger_evaluator_t* evaluator);
+
+/**
+ * Evaluates a trigger from the frame's work list, exactly as rc_client_do_frame would evaluate
+ * it (from the memref values of the frame; no memory is read). Returns the new state
+ * (RC_TRIGGER_STATE_*), which result() must return for it.
+ */
+RC_EXPORT int RC_CCONV rc_client_evaluate_claimed_trigger(void* trigger);
+
+/**
+ * Reports the memory holding the loaded game's memrefs (the values claimed triggers read), as
+ * address ranges, so the host can make them visible to whatever evaluates claimed triggers.
+ * The ranges stay valid until the game is unloaded or more of its data is loaded.
+ */
+typedef void (RC_CCONV *rc_client_memref_storage_callback_t)(const void* address, size_t size, void* userdata);
+RC_EXPORT void RC_CCONV rc_client_enum_memref_storage(rc_client_t* client, rc_client_memref_storage_callback_t callback, void* userdata);
+
+/**
  * Determines if there are any active achievements/leaderboards/rich presence that need processing.
  */
 RC_EXPORT int RC_CCONV rc_client_is_processing_required(rc_client_t* client);

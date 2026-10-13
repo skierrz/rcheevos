@@ -88,6 +88,7 @@ typedef struct rc_client_achievement_info_t {
 
   rc_trigger_t* trigger;
   uint8_t md5[16];
+  uint8_t claimed;     /* evaluated by the host's trigger evaluator */
 
   time_t unlock_time_hardcore;
   time_t unlock_time_casual;
@@ -272,6 +273,12 @@ typedef struct rc_client_game_info_t {
   uint8_t waiting_for_reset;
   uint8_t pending_events;
 
+  rc_client_claimed_trigger_t* claimed_work; /* per-frame work list for the trigger evaluator */
+  uint32_t* claimed_old_measured_value;     /* each listed trigger's state before the frame */
+  uint8_t* claimed_old_state;
+  uint32_t claimed_work_capacity;
+  uint32_t claimed_work_next;               /* next list entry rc_client takes the result of */
+
   rc_buffer_t buffer;
 } rc_client_game_info_t;
 
@@ -342,6 +349,7 @@ typedef struct rc_client_state_t {
   struct rc_client_load_state_t* load;
   struct rc_client_async_handle_t* async_handles[4];
   rc_memref_t* processing_memref;
+  rc_client_trigger_evaluator_t trigger_evaluator;
 } rc_client_state_t;
 
 struct rc_client_t {
