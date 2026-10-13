@@ -218,6 +218,9 @@ void rc_memrefs_destroy(rc_memrefs_t* memrefs)
     }
   } while (modified_memref_list);
 
+  if (memrefs->dependencies)
+    free(memrefs->dependencies);
+
   free(memrefs);
 }
 
@@ -855,9 +858,267 @@ void rc_memrefs_reset_inputs_unchanged(rc_memrefs_t* memrefs) {
   }
 }
 
+/* Modified memrefs are updated in list order. A modified memref only has to be updated if one of
+ * its inputs changed this frame or the last, or if it changed last frame (to clear the changed
+ * flag); otherwise rc_update_modified_memref_value would leave it as is. The dependencies index
+ * finds them: for each memref and modified memref, the modified memrefs that use it. When a memref
+ * changes, its dependents are flagged for an update. A dependent later in the list than a modified
+ * memref sees the new value this frame, one earlier in the list sees it next frame. A modified
+ * memref that changed, or whose inputs were not unchanged (indirect reads, variables, recalls,
+ * invalidated memrefs), is flagged for an update next frame too. */
+struct rc_memref_dependencies_t {
+  uint32_t num_memrefs;          /* The number of memrefs when the index was built. */
+  uint32_t num_modified_memrefs; /* The number of modified memrefs when the index was built. */
+  uint32_t* update;              /* One bit per modified memref: update this frame. NULL if not tracked. */
+  uint32_t* update_next;         /* One bit per modified memref: update next frame. */
+  uint16_t* first_dependent;     /* Per memref, then per modified memref: its first entry in dependents. */
+  uint16_t* dependents;          /* Indices of the modified memrefs that use each memref. */
+};
+
+static uint32_t rc_memrefs_find_index(const rc_memrefs_t* memrefs, uint32_t num_memrefs, const rc_memref_t* memref) {
+  uint32_t index = 0;
+
+  if (memref->value.memref_type == RC_MEMREF_TYPE_MODIFIED_MEMREF) {
+    const rc_modified_memref_t* modified_memref = (const rc_modified_memref_t*)memref;
+    const rc_modified_memref_list_t* modified_memref_list = &memrefs->modified_memrefs;
+    for (; modified_memref_list; modified_memref_list = modified_memref_list->next) {
+      if (modified_memref >= modified_memref_list->items &&
+          modified_memref < modified_memref_list->items + modified_memref_list->count)
+        return num_memrefs + index + (uint32_t)(modified_memref - modified_memref_list->items);
+
+      index += modified_memref_list->count;
+    }
+  }
+  else {
+    const rc_memref_list_t* memref_list = &memrefs->memrefs;
+    for (; memref_list; memref_list = memref_list->next) {
+      if (memref >= memref_list->items && memref < memref_list->items + memref_list->count)
+        return index + (uint32_t)(memref - memref_list->items);
+
+      index += memref_list->count;
+    }
+  }
+
+  return 0xFFFFFFFF;
+}
+
+/* without first_dependent, counts the links. without dependents, counts them per input in
+ * first_dependent. otherwise, stores them. returns -1 if an input is not in the lists. */
+static int32_t rc_memref_dependencies_link(const rc_memrefs_t* memrefs, uint32_t num_memrefs,
+                                           uint16_t* first_dependent, uint16_t* dependents) {
+  const rc_modified_memref_list_t* modified_memref_list = &memrefs->modified_memrefs;
+  uint32_t index = 0;
+  int32_t count = 0;
+
+  for (; modified_memref_list; modified_memref_list = modified_memref_list->next) {
+    const rc_modified_memref_t* modified_memref = modified_memref_list->items;
+    const rc_modified_memref_t* modified_memref_stop = modified_memref + modified_memref_list->count;
+
+    for (; modified_memref < modified_memref_stop; ++modified_memref, ++index) {
+      const rc_operand_t* operand = &modified_memref->parent;
+      uint32_t input;
+
+      do {
+        /* a modified memref with a variable or recall input is updated every frame, as its inputs
+         * are never unchanged */
+        if (rc_operand_is_memref(operand) && operand->value.memref->value.memref_type != RC_MEMREF_TYPE_VALUE &&
+            (operand == &modified_memref->parent || !rc_operand_is_memref(&modified_memref->parent) ||
+             modified_memref->parent.value.memref != operand->value.memref)) {
+          input = rc_memrefs_find_index(memrefs, num_memrefs, operand->value.memref);
+          if (input == 0xFFFFFFFF)
+            return -1;
+
+          if (!first_dependent)
+            ++count;
+          else if (!dependents)
+            ++first_dependent[input];
+          else
+            dependents[--first_dependent[input]] = (uint16_t)index;
+        }
+
+        if (operand == &modified_memref->modifier)
+          break;
+        operand = &modified_memref->modifier;
+      } while (1);
+    }
+  }
+
+  return count;
+}
+
+static rc_memref_dependencies_t* rc_memref_dependencies_create(const rc_memrefs_t* memrefs,
+                                                               uint32_t num_memrefs, uint32_t num_modified_memrefs) {
+  rc_memref_dependencies_t* dependencies;
+  const uint32_t num_inputs = num_memrefs + num_modified_memrefs;
+  const uint32_t num_words = (num_modified_memrefs + 31) / 32;
+  int32_t num_dependents = (num_inputs <= 0xFFFF) ? rc_memref_dependencies_link(memrefs, num_memrefs, NULL, NULL) : -1;
+  uint32_t i, total;
+
+  if (num_dependents < 0 || num_dependents > 0xFFFF) {
+    /* can't be tracked: remember that, so every modified memref is updated every frame */
+    dependencies = (rc_memref_dependencies_t*)calloc(1, sizeof(*dependencies));
+  }
+  else {
+    dependencies = (rc_memref_dependencies_t*)calloc(1, sizeof(*dependencies) + num_words * 2 * sizeof(uint32_t) +
+                                                     (num_inputs + 1 + num_dependents) * sizeof(uint16_t));
+    if (dependencies) {
+      dependencies->update = (uint32_t*)(dependencies + 1);
+      dependencies->update_next = dependencies->update + num_words;
+      dependencies->first_dependent = (uint16_t*)(dependencies->update_next + num_words);
+      dependencies->dependents = dependencies->first_dependent + num_inputs + 1;
+
+      rc_memref_dependencies_link(memrefs, num_memrefs, dependencies->first_dependent, NULL);
+      for (i = 0, total = 0; i <= num_inputs; ++i) {
+        total += dependencies->first_dependent[i];
+        dependencies->first_dependent[i] = (uint16_t)total;
+      }
+      rc_memref_dependencies_link(memrefs, num_memrefs, dependencies->first_dependent, dependencies->dependents);
+
+      /* update every modified memref on the first frame */
+      for (i = 0; i < num_modified_memrefs; ++i)
+        dependencies->update[i >> 5] |= 1U << (i & 31);
+    }
+  }
+
+  if (dependencies) {
+    dependencies->num_memrefs = num_memrefs;
+    dependencies->num_modified_memrefs = num_modified_memrefs;
+  }
+
+  return dependencies;
+}
+
+rc_memref_dependencies_t* rc_memrefs_get_dependencies(rc_memrefs_t* memrefs) {
+  rc_memref_dependencies_t* dependencies = memrefs->dependencies;
+  uint32_t num_memrefs, num_modified_memrefs;
+
+  /* only memrefs created by rc_memrefs_init are tracked: rc_memrefs_destroy frees the index */
+  if (!memrefs->memrefs.allocated)
+    return NULL;
+
+  num_modified_memrefs = rc_memrefs_count_modified_memrefs(memrefs);
+  if (!num_modified_memrefs)
+    return NULL;
+
+  num_memrefs = rc_memrefs_count_memrefs(memrefs);
+  if (!dependencies || dependencies->num_memrefs != num_memrefs ||
+      dependencies->num_modified_memrefs != num_modified_memrefs) {
+    /* memrefs were added (or the state was restored). rebuild the index, which updates
+     * every modified memref on the next frame */
+    if (dependencies)
+      free(dependencies);
+
+    memrefs->dependencies = dependencies = rc_memref_dependencies_create(memrefs, num_memrefs, num_modified_memrefs);
+  }
+
+  return (dependencies && dependencies->update) ? dependencies : NULL;
+}
+
+void rc_memrefs_update_all_modified_memrefs(rc_memrefs_t* memrefs) {
+  /* the index is rebuilt on the next frame, which updates every modified memref */
+  if (memrefs->dependencies) {
+    free(memrefs->dependencies);
+    memrefs->dependencies = NULL;
+  }
+}
+
+void rc_memref_dependencies_memref_changed(rc_memref_dependencies_t* dependencies, uint32_t memref_index) {
+  /* every modified memref is after every memref */
+  const uint16_t* dependent = dependencies->dependents + dependencies->first_dependent[memref_index];
+  const uint16_t* dependent_stop = dependencies->dependents + dependencies->first_dependent[memref_index + 1];
+
+  for (; dependent < dependent_stop; ++dependent)
+    dependencies->update[*dependent >> 5] |= 1U << (*dependent & 31);
+}
+
+static uint32_t rc_lowest_bit_index(uint32_t bits) {
+#if defined(__GNUC__)
+  return (uint32_t)__builtin_ctz(bits);
+#else
+  uint32_t index = 0;
+  while (!(bits & 1)) {
+    bits >>= 1;
+    ++index;
+  }
+  return index;
+#endif
+}
+
+void rc_update_modified_memref_values(rc_memrefs_t* memrefs, rc_memref_dependencies_t* dependencies,
+                                      rc_read_memory_func_t read_memory, void* ud) {
+  rc_modified_memref_list_t* modified_memref_list = &memrefs->modified_memrefs;
+  uint32_t* update;
+  uint32_t* update_next;
+  uint32_t first_index = 0, num_words, word;
+
+  if (!dependencies) {
+    if (modified_memref_list->count) {
+      do {
+        rc_modified_memref_t* modified_memref = modified_memref_list->items;
+        const rc_modified_memref_t* modified_memref_stop = modified_memref + modified_memref_list->count;
+
+        for (; modified_memref < modified_memref_stop; ++modified_memref)
+          rc_update_modified_memref_value(modified_memref, read_memory, ud);
+
+        modified_memref_list = modified_memref_list->next;
+      } while (modified_memref_list);
+    }
+    return;
+  }
+
+  update = dependencies->update;
+  update_next = dependencies->update_next;
+  num_words = (dependencies->num_modified_memrefs + 31) / 32;
+  for (word = 0; word < num_words; ++word) {
+    uint32_t bits;
+
+    /* dependents flagged while updating are always after the current item, so taking the
+     * lowest flagged bit each time visits them in list order */
+    while ((bits = update[word]) != 0) {
+      const uint32_t index = word * 32 + rc_lowest_bit_index(bits);
+      const uint32_t bit = 1U << (index & 31);
+      rc_modified_memref_t* modified_memref;
+      update[word] = bits & ~bit;
+
+      while (index - first_index >= modified_memref_list->count) {
+        first_index += modified_memref_list->count;
+        modified_memref_list = modified_memref_list->next;
+      }
+
+      modified_memref = &modified_memref_list->items[index - first_index];
+      rc_update_modified_memref_value(modified_memref, read_memory, ud);
+
+      if (modified_memref->memref.value.changed) {
+        const uint16_t* dependent = dependencies->dependents +
+            dependencies->first_dependent[dependencies->num_memrefs + index];
+        const uint16_t* dependent_stop = dependencies->dependents +
+            dependencies->first_dependent[dependencies->num_memrefs + index + 1];
+
+        for (; dependent < dependent_stop; ++dependent) {
+          if (*dependent > index)
+            update[*dependent >> 5] |= 1U << (*dependent & 31);
+          else
+            update_next[*dependent >> 5] |= 1U << (*dependent & 31);
+        }
+
+        /* to clear the changed flag */
+        update_next[word] |= bit;
+      }
+      else if (!modified_memref->inputs_unchanged) {
+        update_next[word] |= bit;
+      }
+    }
+  }
+
+  /* update is now empty */
+  dependencies->update = update_next;
+  dependencies->update_next = update;
+}
+
 void rc_update_memref_values(rc_memrefs_t* memrefs, rc_read_memory_func_t read_memory, void* ud) {
+  rc_memref_dependencies_t* dependencies = rc_memrefs_get_dependencies(memrefs);
   rc_memref_list_t* memref_list;
-  rc_modified_memref_list_t* modified_memref_list;
+  uint32_t index = 0;
 
   memref_list = &memrefs->memrefs;
   do
@@ -865,24 +1126,17 @@ void rc_update_memref_values(rc_memrefs_t* memrefs, rc_read_memory_func_t read_m
     rc_memref_t* memref = memref_list->items;
     const rc_memref_t* memref_stop = memref + memref_list->count;
 
-    for (; memref < memref_stop; ++memref) {
+    for (; memref < memref_stop; ++memref, ++index) {
       if (memref->value.type != RC_VALUE_TYPE_NONE)
         rc_update_memref_value(&memref->value, rc_read_memory(memref->address, memref->value.size, read_memory, ud));
+
+      /* an invalidated memref is never unchanged */
+      if (dependencies && (memref->value.changed || memref->value.type == RC_VALUE_TYPE_NONE))
+        rc_memref_dependencies_memref_changed(dependencies, index);
     }
 
     memref_list = memref_list->next;
   } while (memref_list);
 
-  modified_memref_list = &memrefs->modified_memrefs;
-  if (modified_memref_list->count) {
-    do {
-      rc_modified_memref_t* modified_memref = modified_memref_list->items;
-      const rc_modified_memref_t* modified_memref_stop = modified_memref + modified_memref_list->count;
-
-      for (; modified_memref < modified_memref_stop; ++modified_memref)
-        rc_update_modified_memref_value(modified_memref, read_memory, ud);
-
-      modified_memref_list = modified_memref_list->next;
-    } while (modified_memref_list);
-  }
+  rc_update_modified_memref_values(memrefs, dependencies, read_memory, ud);
 }

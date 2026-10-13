@@ -5991,8 +5991,9 @@ int rc_client_is_processing_required(rc_client_t* client)
 
 static void rc_client_update_memref_values(rc_client_t* client) {
   rc_memrefs_t* memrefs = client->game->runtime.memrefs;
+  rc_memref_dependencies_t* dependencies = rc_memrefs_get_dependencies(memrefs);
   rc_memref_list_t* memref_list;
-  rc_modified_memref_list_t* modified_memref_list;
+  uint32_t index = 0;
   int invalidated_memref = 0;
 
   memref_list = &memrefs->memrefs;
@@ -6001,9 +6002,13 @@ static void rc_client_update_memref_values(rc_client_t* client) {
     const rc_memref_t* memref_stop = memref + memref_list->count;
     uint32_t value;
 
-    for (; memref < memref_stop; ++memref) {
-      if (memref->value.type == RC_VALUE_TYPE_NONE)
+    for (; memref < memref_stop; ++memref, ++index) {
+      if (memref->value.type == RC_VALUE_TYPE_NONE) {
+        /* an invalidated memref is never unchanged */
+        if (dependencies)
+          rc_memref_dependencies_memref_changed(dependencies, index);
         continue;
+      }
 
       /* if processing_memref is set, and the memory read fails, all dependent achievements will be disabled */
       client->state.processing_memref = memref;
@@ -6012,10 +6017,14 @@ static void rc_client_update_memref_values(rc_client_t* client) {
 
       if (client->state.processing_memref) {
         rc_update_memref_value(&memref->value, value);
+        if (dependencies && memref->value.changed)
+          rc_memref_dependencies_memref_changed(dependencies, index);
       }
       else {
         /* if the peek function cleared the processing_memref, the memref was invalidated */
         invalidated_memref = 1;
+        if (dependencies)
+          rc_memref_dependencies_memref_changed(dependencies, index);
       }
     }
 
@@ -6024,18 +6033,7 @@ static void rc_client_update_memref_values(rc_client_t* client) {
 
   client->state.processing_memref = NULL;
 
-  modified_memref_list = &memrefs->modified_memrefs;
-  if (modified_memref_list->count) {
-    do {
-      rc_modified_memref_t* modified_memref = modified_memref_list->items;
-      const rc_modified_memref_t* modified_memref_stop = modified_memref + modified_memref_list->count;
-
-      for (; modified_memref < modified_memref_stop; ++modified_memref)
-        rc_update_modified_memref_value(modified_memref, rc_client_read_modified_memory_helper, client);
-
-      modified_memref_list = modified_memref_list->next;
-    } while (modified_memref_list);
-  }
+  rc_update_modified_memref_values(memrefs, dependencies, rc_client_read_modified_memory_helper, client);
 
   if (invalidated_memref)
     rc_client_update_active_achievements(client->game);

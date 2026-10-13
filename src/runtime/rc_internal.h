@@ -39,9 +39,12 @@ typedef struct rc_modified_memref_list_t {
   uint8_t allocated;
 } rc_modified_memref_list_t;
 
+typedef struct rc_memref_dependencies_t rc_memref_dependencies_t;
+
 typedef struct rc_memrefs_t {
   rc_memref_list_t memrefs;
   rc_modified_memref_list_t modified_memrefs;
+  rc_memref_dependencies_t* dependencies;  /* Which modified memrefs need updating (see rc_memref.c). */
 } rc_memrefs_t;
 
 typedef struct rc_trigger_with_memrefs_t {
@@ -291,6 +294,11 @@ void rc_get_memref_value(rc_typed_value_t* value, rc_memref_t* memref, int opera
 uint32_t rc_get_modified_memref_value(const rc_modified_memref_t* memref, rc_read_memory_func_t read_memory, void* ud);
 void rc_memrefs_reset_inputs_unchanged(rc_memrefs_t* memrefs);
 void rc_update_modified_memref_value(rc_modified_memref_t* memref, rc_read_memory_func_t read_memory, void* ud);
+rc_memref_dependencies_t* rc_memrefs_get_dependencies(rc_memrefs_t* memrefs);
+void rc_memref_dependencies_memref_changed(rc_memref_dependencies_t* dependencies, uint32_t memref_index);
+void rc_update_modified_memref_values(rc_memrefs_t* memrefs, rc_memref_dependencies_t* dependencies,
+                                      rc_read_memory_func_t read_memory, void* ud);
+void rc_memrefs_update_all_modified_memrefs(rc_memrefs_t* memrefs);
 uint8_t rc_memref_shared_size(uint8_t size);
 uint32_t rc_memref_mask(uint8_t size);
 uint32_t rc_memref_bytes(uint8_t size);
