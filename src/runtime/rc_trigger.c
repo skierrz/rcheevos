@@ -47,6 +47,9 @@ void rc_parse_trigger_internal(rc_trigger_t* self, const char** memaddr, rc_pars
   self->state = RC_TRIGGER_STATE_WAITING;
   self->has_hits = 0;
   self->has_memrefs = 0;
+  self->cd_flags = 0;
+  self->cd_state = 0;
+  self->cd_frame = 0;
 }
 
 int rc_trigger_size(const char* memaddr) {
@@ -341,4 +344,151 @@ void rc_reset_trigger(rc_trigger_t* self) {
     self->measured_value = RC_MEASURED_UNKNOWN;
 
   self->has_hits = 0;
+  self->cd_flags = 0;
+}
+
+/* Change-driven evaluation: skip a trigger whose evaluation can't change.
+ *
+ * Evaluating a trigger is a function of its state (hit counts, is_true,
+ * is_paused, state, has_hits, measured_value) and its operand values; for
+ * rc_client's triggers nothing else (they have no memrefs of their own, and
+ * Remember/Recall resolve to memrefs). An operand's value, delta and prior
+ * are all unchanged at frame f if its memref's changed flag was clear at f
+ * and at f-1. So if every memref the trigger reads was unchanged at f and
+ * f-1, and the evaluation at f-1 changed none of its state and returned
+ * trigger->state, the evaluation at f would do exactly the same: skipping it
+ * and returning trigger->state gives the same result, the same state and the
+ * same bytes. A skipped frame keeps the trigger clean, so it stays skipped
+ * until a memref it reads changes.
+ *
+ * frame: the caller's count of memref updates. A trigger not evaluated on
+ * the update before (cd_frame != frame - 1) can't be skipped: its memrefs
+ * may have changed in between unseen. Any other change to a trigger's state
+ * goes through rc_reset_trigger or the progress reader (they clear
+ * cd_flags) or changes trigger->state (checked against cd_state). */
+#define RC_CD_CLEAN 1       /* the last evaluation changed no state and returned trigger->state */
+#define RC_CD_DEP_PREV 2    /* a memref it reads changed at the last evaluation */
+#define RC_CD_MAX_CONDITIONS 128
+
+static int rc_operand_changed(const rc_operand_t* operand) {
+  switch (operand->type) {
+    case RC_OPERAND_CONST:
+    case RC_OPERAND_FP:
+    case RC_OPERAND_FUNC:
+      return 0;
+
+    case RC_OPERAND_RECALL:
+      if (!rc_operand_type_is_memref(operand->memref_access_type) || !operand->value.memref)
+        return 0;
+      return operand->value.memref->value.changed;
+
+    default:
+      return operand->value.memref->value.changed;
+  }
+}
+
+static int rc_condset_memrefs_changed(const rc_condset_t* condset) {
+  const rc_condition_t* condition;
+  for (condition = condset->conditions; condition; condition = condition->next) {
+    if (rc_operand_changed(&condition->operand1) || rc_operand_changed(&condition->operand2))
+      return 1;
+  }
+  return 0;
+}
+
+static int rc_trigger_memrefs_changed(const rc_trigger_t* self) {
+  const rc_condset_t* condset;
+  if (self->requirement && rc_condset_memrefs_changed(self->requirement))
+    return 1;
+  for (condset = self->alternative; condset; condset = condset->next) {
+    if (rc_condset_memrefs_changed(condset))
+      return 1;
+  }
+  return 0;
+}
+
+/* the state an evaluation can change, for one comparison before and after */
+typedef struct rc_trigger_snapshot_t {
+  uint32_t hits[RC_CD_MAX_CONDITIONS];
+  uint8_t flags[RC_CD_MAX_CONDITIONS];   /* is_true; is_paused on a condset's first entry */
+  uint32_t count;
+  uint32_t measured_value;
+  uint8_t state;
+  uint8_t has_hits;
+} rc_trigger_snapshot_t;
+
+static int rc_condset_snapshot(const rc_condset_t* condset, rc_trigger_snapshot_t* snapshot, int compare) {
+  const rc_condition_t* condition;
+  uint32_t i = snapshot->count;
+  if (!condset->conditions)   /* nowhere to keep is_paused: never clean */
+    return 0;
+  for (condition = condset->conditions; condition; condition = condition->next, ++i) {
+    uint8_t flags = (uint8_t)(condition->is_true | (condition == condset->conditions ? (condset->is_paused ? 0x80 : 0) : 0));
+    if (i >= RC_CD_MAX_CONDITIONS)
+      return 0;
+    if (compare) {
+      if (snapshot->hits[i] != condition->current_hits || snapshot->flags[i] != flags)
+        return 0;
+    }
+    else {
+      snapshot->hits[i] = condition->current_hits;
+      snapshot->flags[i] = flags;
+    }
+  }
+  snapshot->count = i;
+  return 1;
+}
+
+/* compare 0: take the snapshot (returns 0 if the trigger is too big); compare 1: returns 1 if unchanged */
+static int rc_trigger_snapshot(const rc_trigger_t* self, rc_trigger_snapshot_t* snapshot, int compare) {
+  const rc_condset_t* condset;
+  snapshot->count = 0;
+  if (compare) {
+    if (snapshot->measured_value != self->measured_value || snapshot->state != self->state || snapshot->has_hits != self->has_hits)
+      return 0;
+  }
+  else {
+    snapshot->measured_value = self->measured_value;
+    snapshot->state = self->state;
+    snapshot->has_hits = self->has_hits;
+  }
+  if (self->requirement && !rc_condset_snapshot(self->requirement, snapshot, compare))
+    return 0;
+  for (condset = self->alternative; condset; condset = condset->next) {
+    if (!rc_condset_snapshot(condset, snapshot, compare))
+      return 0;
+  }
+  return 1;
+}
+
+int rc_evaluate_trigger_change_driven(rc_trigger_t* self, rc_read_memory_func_t read_memory, void* ud, uint32_t frame) {
+  rc_trigger_snapshot_t snapshot;
+  int changed, followed, have_snapshot, ret;
+
+  if (self->has_memrefs || !rc_trigger_state_active(self->state)) {
+    /* not a candidate: its own memrefs, or a state rc_evaluate_trigger handles without evaluating */
+    self->cd_flags = 0;
+    return rc_evaluate_trigger(self, read_memory, ud, NULL);
+  }
+
+  changed = rc_trigger_memrefs_changed(self);
+  followed = (self->cd_frame == frame - 1);   /* evaluated on the update before this one */
+
+  if (!changed && followed && (self->cd_flags & (RC_CD_CLEAN | RC_CD_DEP_PREV)) == RC_CD_CLEAN &&
+      self->state == self->cd_state) {
+    self->cd_frame = frame;
+    return self->state;
+  }
+
+  /* the evaluation can only make the trigger skippable next frame if its memrefs are unchanged now */
+  have_snapshot = !changed && rc_trigger_snapshot(self, &snapshot, 0);
+
+  ret = rc_evaluate_trigger(self, read_memory, ud, NULL);
+
+  self->cd_flags = changed ? RC_CD_DEP_PREV : 0;
+  if (have_snapshot && ret == self->state && ret == snapshot.state && rc_trigger_snapshot(self, &snapshot, 1))
+    self->cd_flags |= RC_CD_CLEAN;
+  self->cd_state = self->state;
+  self->cd_frame = frame;
+  return ret;
 }

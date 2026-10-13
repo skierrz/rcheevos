@@ -289,6 +289,11 @@ struct rc_trigger_t {
 
   /* True if the trigger has its own rc_memrefs_t */
   uint8_t has_memrefs;
+
+  /* Change-driven evaluation (rc_client_set_change_driven_enabled): internal */
+  uint8_t cd_flags;
+  uint8_t cd_state;
+  uint32_t cd_frame;
 };
 
 RC_EXPORT int RC_CCONV rc_trigger_size(const char* memaddr);
