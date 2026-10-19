@@ -83,8 +83,10 @@ typedef struct rc_memrefs_t {
   rc_memref_t** index;
   /* Number of slots in index (a power of 2). */
   uint32_t index_capacity;
-  /* Number of entries in index. */
+  /* Number of entries in index; without one, entries added since the last build. */
   uint32_t index_count;
+  /* A preparse list: indexed once it is large (rc_destroy_preparse_state frees it). */
+  uint8_t index_scratch;
 } rc_memrefs_t;
 
 /*****************************************************************************\

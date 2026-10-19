@@ -153,18 +153,25 @@ static void rc_memrefs_index_build(rc_memrefs_t* memrefs) {
   }
 }
 
-/* returns the index for a list created by rc_memrefs_init (freed by rc_memrefs_destroy), else NULL */
+/* a preparse list gets an index once this many entries were added: most stay smaller */
+#define RC_MEMREF_SCRATCH_INDEX_MIN 64
+
+/* returns the index for a list created by rc_memrefs_init (freed by rc_memrefs_destroy), or for a
+ * large preparse list (freed by rc_destroy_preparse_state), else NULL */
 static rc_memref_t** rc_memrefs_get_index(rc_memrefs_t* memrefs) {
-  if (!memrefs->index && memrefs->memrefs.allocated)
+  if (!memrefs->index && (memrefs->memrefs.allocated ||
+      (memrefs->index_scratch && memrefs->index_count >= RC_MEMREF_SCRATCH_INDEX_MIN)))
     rc_memrefs_index_build(memrefs);
 
   return memrefs->index;
 }
 
-/* adds a new entry (already in its list) to the index, if the list has one */
+/* adds a new entry (already in its list) to the index, if the list has one; else counts it */
 static void rc_memrefs_index_add(rc_memrefs_t* memrefs, rc_memref_t* memref) {
-  if (!memrefs->index)
+  if (!memrefs->index) {
+    memrefs->index_count++;
     return;
+  }
 
   if ((memrefs->index_count + 1) * 4 >= memrefs->index_capacity * 3)
     rc_memrefs_index_build(memrefs);
