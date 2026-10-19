@@ -98,10 +98,13 @@ void rc_init_preparse_state(rc_preparse_state_t* preparse)
 {
   rc_init_parse_state(&preparse->parse, NULL);
   rc_init_parse_state_memrefs(&preparse->parse, &preparse->memrefs);
+  preparse->memrefs.index_scratch = 1;
 }
 
 void rc_destroy_preparse_state(rc_preparse_state_t* preparse)
 {
+  free(preparse->memrefs.index);
+  preparse->memrefs.index = NULL;
   rc_destroy_parse_state(&preparse->parse);
 }
 

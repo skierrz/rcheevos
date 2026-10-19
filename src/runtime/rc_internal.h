@@ -47,7 +47,8 @@ typedef struct rc_memrefs_t {
   rc_memref_dependencies_t* dependencies;  /* Which modified memrefs need updating (see rc_memref.c). */
   rc_memref_t** index;     /* hash index of both lists, only for lists created by rc_memrefs_init */
   uint32_t index_capacity; /* number of slots in index (a power of 2) */
-  uint32_t index_count;    /* number of entries in index */
+  uint32_t index_count;    /* number of entries in index; without one, entries added since the last build */
+  uint8_t index_scratch;   /* a preparse list: indexed once it is large (rc_destroy_preparse_state frees it) */
 } rc_memrefs_t;
 
 typedef struct rc_trigger_with_memrefs_t {
