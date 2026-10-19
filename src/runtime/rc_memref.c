@@ -63,6 +63,9 @@ static uint32_t rc_memref_hash_operand(const rc_operand_t* operand, int levels) 
       return rc_memref_hash_mix(hash, memref->value.size);
     case RC_MEMREF_TYPE_MODIFIED_MEMREF: {
       const rc_modified_memref_t* modified_memref = (const rc_modified_memref_t*)memref;
+      /* compared by rc_operands_are_equal; separates the steps of a long AddSource chain,
+       * which otherwise look alike past levels and share a few hashes */
+      hash = rc_memref_hash_mix(hash, modified_memref->depth);
       if (levels == 0)
         return hash;
       return rc_memref_hash_modifiers(hash, &modified_memref->parent, modified_memref->modifier_type,
